@@ -4,7 +4,7 @@
 2. Open VSCode Extension Manager
 3. Search for official PlatformIO IDE extension
 4. Install PlatformIO IDE.
-5. Clone PaigeBraille/firmware repository and open folder on VSCode
+5. Clone `PaigeBraille/firmware` repository and open folder on VSCode
 6. PlatformIO build button to update `.pio/build/wifi/firmware.bin`
 6. Create and upload a config file to tailor the firmware. 
 
