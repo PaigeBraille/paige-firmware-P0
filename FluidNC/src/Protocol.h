@@ -94,7 +94,15 @@ extern NoArgEvent motionCancelEvent;
 extern NoArgEvent sleepEvent;
 extern NoArgEvent resetEvent;
 extern NoArgEvent debugEvent;
-
+extern NoArgEvent key1Event;
+extern NoArgEvent key2Event;
+extern NoArgEvent key3Event;
+extern NoArgEvent key4Event;
+extern NoArgEvent key5Event;
+extern NoArgEvent key6Event;
+extern NoArgEvent keySEvent;
+extern NoArgEvent keyBEvent;
+extern NoArgEvent keyNEvent;
 // extern NoArgEvent statusReportEvent;
 
 extern xQueueHandle event_queue;

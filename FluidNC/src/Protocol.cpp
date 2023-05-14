@@ -19,6 +19,8 @@
 #include "Settings.h"       // settings_execute_startup
 #include "Machine/LimitPin.h"
 
+#include "Paige.h"
+
 volatile ExecAlarm rtAlarm;  // Global realtime executor bitflag variable for setting various alarms.
 
 std::map<ExecAlarm, const char*> AlarmNames = {
@@ -1012,6 +1014,85 @@ static void protocol_do_limit(void* arg) {
         return;
     }
 }
+
+std::string protocol_ascii(){
+    const unsigned char ASCII[65] = 
+        {' ','a','1','b','\'','k','2','l',
+        '@','c','i','f','/','m','s','p',
+        '"','e','3','h','9','o','6','r',
+        '^','d','j','g','>','n','t','q',
+        ',','*','5','<','-','u','8','v',
+        '.','%','[','$','+','x','!','&',
+        ';','u','4','\\','0','z','7','(',
+        '_','?','w',']','#','y',')','=','\n'};
+   std::string ret = "";
+    ret = char(ASCII[paige_pressed]);
+
+    return ret;
+}
+
+static void protocol_key1() {
+    paige_pressed |= (1<<0);  // Set a bit to remember the button being down
+    paige_buttons[0] = 1;
+}
+
+static void protocol_key2() {
+    paige_pressed |= (1<<1);  // Set a bit to remember the button being down
+    paige_buttons[1] = 1;
+}
+
+static void protocol_key3() {
+    paige_pressed |= (1<<2);  // Set a bit to remember the button being down
+    paige_buttons[2] = 1;
+}
+
+static void protocol_key4() {
+    paige_pressed |= (1<<3);  // Set a bit to remember the button being down
+    paige_buttons[3] = 1;
+}
+
+static void protocol_key5() {
+    paige_pressed |= (1<<4);  // Set a bit to remember the button being down
+    paige_buttons[4] = 1;
+}
+
+static void protocol_key6() {
+    paige_pressed |= (1<<5);  // Set a bit to remember the button being down
+    paige_buttons[5] = 1;
+}
+
+static void protocol_keyS() {
+    if(paige_file_open == 1){
+        paige_file += protocol_ascii();
+        paige_file_send += protocol_ascii();
+        log_info("PAIGE:FILE:"+paige_file_send);
+    }
+    else{log_info("PAIGE:ASCII:"+protocol_ascii());}
+    paige_pressed = 0;
+}
+
+static void protocol_keyB() {
+
+    log_info("PAIGE:BACK_SPACE:");
+    if(paige_file_open == 1){
+        unsigned int strLen = paige_file.length();
+        paige_file.erase(1,strLen);
+        paige_file_send.erase(1,strLen);
+    }
+}
+
+static void protocol_keyN() {
+    paige_file_start_time = millis();
+    paige_newline = 1;
+    pinMode(27, OUTPUT);
+    digitalWrite(27, LOW);
+    if(paige_file_open == 1){
+        paige_file += "\n";
+        paige_file_send += "A";
+        log_info("PAIGE:FILE:"+paige_file_send);
+    }
+    else {log_info("PAIGE:ASCII:\n");}
+}
 ArgEvent feedOverrideEvent { protocol_do_feed_override };
 ArgEvent rapidOverrideEvent { protocol_do_rapid_override };
 ArgEvent spindleOverrideEvent { protocol_do_spindle_override };
@@ -1027,6 +1108,15 @@ NoArgEvent cycleStopEvent { protocol_do_cycle_stop };
 NoArgEvent motionCancelEvent { protocol_do_motion_cancel };
 NoArgEvent sleepEvent { protocol_do_sleep };
 NoArgEvent debugEvent { report_realtime_debug };
+NoArgEvent key1Event { protocol_key1 };
+NoArgEvent key2Event { protocol_key2 };
+NoArgEvent key3Event { protocol_key3 };
+NoArgEvent key4Event { protocol_key4 };
+NoArgEvent key5Event { protocol_key5 };
+NoArgEvent key6Event { protocol_key6 };
+NoArgEvent keySEvent { protocol_keyS };
+NoArgEvent keyBEvent { protocol_keyB };
+NoArgEvent keyNEvent { protocol_keyN };
 
 // Only mc_reset() is permitted to set rtReset.
 NoArgEvent resetEvent { mc_reset };

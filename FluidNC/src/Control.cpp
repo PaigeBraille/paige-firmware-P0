@@ -16,6 +16,15 @@ Control::Control() {
     _pins.push_back(new ControlPin(&macro1Event, "macro1_pin", '1'));
     _pins.push_back(new ControlPin(&macro2Event, "macro2_pin", '2'));
     _pins.push_back(new ControlPin(&macro3Event, "macro3_pin", '3'));
+    _pins.push_back(new ControlPin(&key1Event, "key1_pin", '0'));
+    _pins.push_back(new ControlPin(&key2Event, "key2_pin", '1'));
+    _pins.push_back(new ControlPin(&key3Event, "key3_pin", '2'));
+    _pins.push_back(new ControlPin(&key4Event, "key4_pin", '3'));
+    _pins.push_back(new ControlPin(&key5Event, "key5_pin", '4'));
+    _pins.push_back(new ControlPin(&key6Event, "key6_pin", '5'));
+    _pins.push_back(new ControlPin(&keySEvent, "keyS_pin", 'S'));
+    _pins.push_back(new ControlPin(&keyBEvent, "keyB_pin", 'B'));
+    _pins.push_back(new ControlPin(&keyNEvent, "keyN_pin", 'N'));
 }
 
 void Control::init() {
@@ -66,4 +75,11 @@ bool Control::safety_door_ajar() {
     // because that is the default for the value field, which will
     // never be changed for an undefined pin.
     return _pins[0]->get();
+}
+// Returns if new line is pressed.
+bool Control::paige_new_line() {
+    // If a safety door pin is not defined, this will return false
+    // because that is the default for the value field, which will
+    // never be changed for an undefined pin.
+    return _pins[16]->get();
 }

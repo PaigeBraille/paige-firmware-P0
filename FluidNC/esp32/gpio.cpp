@@ -10,6 +10,11 @@
 
 #include "src/Protocol.h"
 
+#include "src/Paige.h"
+#include "src/Control.h"
+#include "src/Machine/MachineConfig.h"
+#include "src/FileStream.h" 
+
 #include <vector>
 
 static gpio_dev_t* _gpio_dev = GPIO_HAL_GET_HW(GPIO_PORT_0);
@@ -472,6 +477,41 @@ void gpio_clear_action(int gpio_num) {
     gpio_interest &= ~mask;
 }
 void poll_gpios() {
+    // PAIGE: New line and buzzer.
+    if(!config->_control->paige_new_line()){
+        paige_newline = 0;
+    } 
+    if(millis()-paige_file_start_time > 1400){
+        pinMode(27, OUTPUT);
+        digitalWrite(27, LOW);
+    }
+    if(millis()-paige_file_start_time > 1000 && paige_newline == 1 && paige_file_open == 0 && config->_control->paige_new_line()){
+        paige_file_open = 1;
+        paige_newline = 0;
+        paige_file = "";
+        paige_file_send = "";
+        log_info("FILE OPENED");
+        digitalWrite(27, HIGH);
+    }
+    else if(millis()-paige_file_start_time > 1000 && paige_newline == 1 && paige_file_open == 1 && config->_control->paige_new_line()){
+        paige_file_open = 0;
+        paige_newline   = 0;
+        unsigned int strLen = paige_file.length();
+        paige_file.erase(1,strLen);
+        strLen = paige_file.length();
+        uint8_t charArray[strLen + 1];
+        std::copy(paige_file.begin(),paige_file.end(),charArray);
+        // Name file
+        int nl = paige_file.find('\n',0);
+        std::string filename = "/sd/" + paige_file.substr(0,nl) + ".brf";
+        // Write file to SD card.
+        FileStream nFile { filename, "w" };
+        nFile.write(charArray, strLen + 1);
+        log_info("FILE CLOSED");
+        digitalWrite(27, HIGH);
+    }
+
+    // FluidNC
     gpio_mask_t gpio_this = (((uint64_t)REG_READ(GPIO_IN1_REG)) << 32) | REG_READ(GPIO_IN_REG);
 
     gpio_mask_t gpio_changes = (gpio_this ^ gpio_current) & gpio_interest;

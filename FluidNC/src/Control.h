@@ -22,6 +22,7 @@ public:
 
     bool stuck();
     bool safety_door_ajar();
+    bool paige_new_line();
 
     std::string report_status();
 
