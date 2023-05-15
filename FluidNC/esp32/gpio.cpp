@@ -481,34 +481,33 @@ void poll_gpios() {
     if(!config->_control->paige_new_line()){
         paige_newline = 0;
     } 
-    if(millis()-paige_file_start_time > 1400){
-        pinMode(27, OUTPUT);
-        digitalWrite(27, LOW);
-    }
+    // if(millis()-paige_file_start_time > 1400){
+    //     pinMode(27, OUTPUT);
+    //     digitalWrite(27, LOW);
+    // }
     if(millis()-paige_file_start_time > 1000 && paige_newline == 1 && paige_file_open == 0 && config->_control->paige_new_line()){
         paige_file_open = 1;
         paige_newline = 0;
         paige_file = "";
         paige_file_send = "";
+        log_info("PAIGE:FILE:"+paige_file_send);
         log_info("FILE OPENED");
-        digitalWrite(27, HIGH);
+        protocol_send_event(&macro0Event);
     }
     else if(millis()-paige_file_start_time > 1000 && paige_newline == 1 && paige_file_open == 1 && config->_control->paige_new_line()){
         paige_file_open = 0;
         paige_newline   = 0;
         unsigned int strLen = paige_file.length();
-        paige_file.erase(1,strLen);
-        strLen = paige_file.length();
-        uint8_t charArray[strLen + 1];
+        uint8_t charArray[strLen];
         std::copy(paige_file.begin(),paige_file.end(),charArray);
         // Name file
         int nl = paige_file.find('\n',0);
         std::string filename = "/sd/" + paige_file.substr(0,nl) + ".brf";
         // Write file to SD card.
         FileStream nFile { filename, "w" };
-        nFile.write(charArray, strLen + 1);
+        nFile.write(charArray, strLen);
         log_info("FILE CLOSED");
-        digitalWrite(27, HIGH);
+        protocol_send_event(&macro1Event);
     }
 
     // FluidNC

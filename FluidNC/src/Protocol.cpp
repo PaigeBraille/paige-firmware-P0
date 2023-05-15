@@ -1082,10 +1082,11 @@ static void protocol_keyB() {
 }
 
 static void protocol_keyN() {
+    sys.state = State::Idle;
     paige_file_start_time = millis();
     paige_newline = 1;
-    pinMode(27, OUTPUT);
-    digitalWrite(27, LOW);
+    // pinMode(27, OUTPUT);
+    // digitalWrite(27, LOW);
     if(paige_file_open == 1){
         paige_file += "\n";
         paige_file_send += "A";
