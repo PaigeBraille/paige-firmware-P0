@@ -16,6 +16,7 @@
 #include "src/FileStream.h" 
 
 #include <vector>
+#include <algorithm>
 
 static gpio_dev_t* _gpio_dev = GPIO_HAL_GET_HW(GPIO_PORT_0);
 
@@ -478,25 +479,29 @@ void gpio_clear_action(int gpio_num) {
 }
 void poll_gpios() {
     // PAIGE: New line and buzzer.
-    if(!config->_control->paige_new_line()){
-        paige_newline = 0;
+    if(!config->_control->paige_new_line()){ // Clear new line if short press.
+        paige_newline = 0; 
     } 
-    // if(millis()-paige_file_start_time > 1400){
-    //     pinMode(27, OUTPUT);
-    //     digitalWrite(27, LOW);
-    // }
-    if(millis()-paige_file_start_time > 1000 && paige_newline == 1 && paige_file_open == 0 && config->_control->paige_new_line()){
+    if(millis()-paige_file_start_time > 1000 && paige_newline == 1 && paige_file_open == 0 && config->_control->paige_new_line()){ // Open file. 
         paige_file_open = 1;
         paige_newline = 0;
         paige_file = "";
-        paige_file_send = "";
-        log_info("PAIGE:FILE:"+paige_file_send);
-        log_info("FILE OPENED");
-        protocol_send_event(&macro0Event);
+
+        log_info("PAIGE:FILE:"+paige_file); // Send string to web-app.
+        log_info("FILE OPENED");           
+        protocol_send_event(&macro0Event); // Run macro for buzzer.
     }
-    else if(millis()-paige_file_start_time > 1000 && paige_newline == 1 && paige_file_open == 1 && config->_control->paige_new_line()){
+    else if(millis()-paige_file_start_time > 1000 && paige_newline == 1 && paige_file_open == 1 && config->_control->paige_new_line()){ // Close and save file. 
         paige_file_open = 0;
         paige_newline   = 0;
+
+        // Replace "A" by "\n" before storing a completed file.
+        std::string x = "A", y = "\n";
+        size_t pos;
+        while ((pos = paige_file.find(x)) != std::string::npos) {
+            paige_file.replace(pos, 1, y);
+        }
+        // Conver std::strinf into unit8_t array for file saving.
         unsigned int strLen = paige_file.length();
         uint8_t charArray[strLen];
         std::copy(paige_file.begin(),paige_file.end(),charArray);
