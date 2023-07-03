@@ -13,6 +13,8 @@
 #include "src/Paige.h"
 #include "src/Control.h"
 #include "src/Machine/MachineConfig.h"
+#include "src/WebUI/Commands.h"
+#include "src/WebUI/WifiConfig.h"
 #include "src/FileStream.h" 
 
 #include <vector>
@@ -154,18 +156,24 @@ static void gpio_send_action(int gpio_num, bool active) {
 
 void poll_gpios() {
     // PAIGE: New line and buzzer.
-    if(!config->_control->paige_new_line()){ // Clear new line if short press.
+    // Clear new line and back space if short press.
+    if(!config->_control->paige_new_line()){ 
         paige_newline = 0; 
     } 
+    if(!config->_control->paige_backspace()){ 
+        paige_backspace = 0; 
+    } 
+    // Open file
     if(millis()-paige_file_start_time > 1000 && paige_newline == 1 && paige_file_open == 0 && config->_control->paige_new_line()){ // Open file. 
         paige_file_open = 1;
         paige_newline = 0;
         paige_file = "";
 
         log_info("PAIGE:FILE:"+paige_file); // Send string to web-app.
-        log_info("FILE OPENED");           
+        log_info("FILE OPENED");         
         protocol_send_event(&macro0Event); // Run macro for buzzer.
     }
+    // Close file
     else if(millis()-paige_file_start_time > 1000 && paige_newline == 1 && paige_file_open == 1 && config->_control->paige_new_line()){ // Close and save file. 
         paige_file_open = 0;
         paige_newline   = 0;
@@ -188,6 +196,14 @@ void poll_gpios() {
         nFile.write(charArray, strLen);
         log_info("FILE CLOSED");
         protocol_send_event(&macro1Event);
+    }
+    // Restore settings
+    if(millis()-paige_restore_start_time > 5000 && paige_backspace == 1){  
+        paige_backspace = 0;
+
+        log_info("Restoring settings");
+        WebUI::wifi_config.reset_settings();
+        WebUI::COMMANDS::restart_MCU();          
     }
 
     // FluidNC

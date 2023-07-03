@@ -1082,7 +1082,9 @@ static void protocol_keyS() { // Space key event: records corded press.
 }
 
 static void protocol_keyB() { // Backspace key event.
-
+    sys.state = State::Idle;
+    paige_restore_start_time = millis();
+    paige_backspace = 1;
     if(paige_file_open == 1){
         unsigned int strLen = paige_file.length();
         paige_file.pop_back();

@@ -13,6 +13,7 @@ int paige_space                       = 0;
 
 
 uint32_t paige_file_start_time = millis(); 
+uint32_t paige_restore_start_time = millis(); 
 int paige_file_open                   = 0;
 int paige_file_closed                 = 1;
 std::string paige_file              = " ";
