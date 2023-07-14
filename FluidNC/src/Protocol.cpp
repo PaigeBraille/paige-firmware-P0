@@ -1035,7 +1035,7 @@ std::string protocol_ascii(){  // Get ASCII equivalent
         '^','d','j','g','>','n','t','q',
         ',','*','5','<','-','u','8','v',
         '.','%','[','$','+','x','!','&',
-        ';','u','4','\\','0','z','7','(',
+        ';','B','4','\\','0','z','7','(',
         '_','?','w',']','#','y',')','=','\n'};
    std::string ret = "";
     ret = char(ASCII[paige_pressed]);
@@ -1085,7 +1085,7 @@ static void protocol_keyB() { // Backspace key event.
     sys.state = State::Idle;
     paige_restore_start_time = millis();
     paige_backspace = 1;
-    if(paige_file_open == 1){
+    if(paige_file_open == 1 & paige_file.length() != 0){
         unsigned int strLen = paige_file.length();
         paige_file.pop_back();
         log_info("PAIGE:FILE:"+paige_file); // Send string to web-app.

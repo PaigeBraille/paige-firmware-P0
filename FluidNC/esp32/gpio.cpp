@@ -159,6 +159,7 @@ void poll_gpios() {
     // Clear new line and back space if short press.
     if(!config->_control->paige_new_line()){ 
         paige_newline = 0; 
+        
     } 
     if(!config->_control->paige_backspace()){ 
         paige_backspace = 0; 
@@ -179,10 +180,13 @@ void poll_gpios() {
         paige_newline   = 0;
 
         // Replace "A" by "\n" before storing a completed file.
-        std::string x = "A", y = "\n";
+        std::string x = "A", y = "\n", j = "B", k =":";
         size_t pos;
         while ((pos = paige_file.find(x)) != std::string::npos) {
             paige_file.replace(pos, 1, y);
+        }
+        while ((pos = paige_file.find(j)) != std::string::npos) {
+            paige_file.replace(pos, 1, k);
         }
         // Conver std::strinf into unit8_t array for file saving.
         unsigned int strLen = paige_file.length();
