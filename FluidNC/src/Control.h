@@ -24,6 +24,7 @@ public:
     bool safety_door_ajar();
     bool paige_new_line();
     bool paige_backspace();
+    bool paige_button_pressed();
 
     std::string report_status();
 

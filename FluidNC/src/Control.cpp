@@ -91,3 +91,16 @@ bool Control::paige_new_line() {
     // never be changed for an undefined pin.
     return _pins[16]->get();
 }
+
+// Returns if any button is pressed.
+bool Control::paige_button_pressed() {
+    // If a safety door pin is not defined, this will return false
+    // because that is the default for the value field, which will
+    // never be changed for an undefined pin.
+    for (auto pin : _pins) {
+        if (pin->get()) {
+            return true;
+        }
+    }
+    return false;
+}

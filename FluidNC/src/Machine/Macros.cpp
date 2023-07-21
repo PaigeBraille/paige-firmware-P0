@@ -82,10 +82,10 @@ bool Macros::run_macro(size_t index) {
                 }
                 i += 3;
                 break;
-            case 'Y':
-                paige_flag = 1;
-                paige_count = paige_count + 1;
-                break;
+            // case 'Y':
+            //     paige_flag = 1;
+            //     paige_count = paige_count + 1;
+            //     break;
             default:
                 WebUI::inputBuffer.push(c);
                 break;

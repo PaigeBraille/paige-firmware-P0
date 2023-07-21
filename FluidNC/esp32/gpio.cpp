@@ -157,25 +157,29 @@ static void gpio_send_action(int gpio_num, bool active) {
 void poll_gpios() {
     // PAIGE: New line and buzzer.
     // Clear new line and back space if short press.
-    if(paige_flag == 1){
-            // Conver std::strinf into unit8_t array for file saving.
-            unsigned int strLen = paige_file.length();
-            uint8_t charArray[strLen];
-            std::copy(paige_file.begin(),paige_file.end(),charArray);
-            // Name file
-            std::string filename = "/sd/"+std::to_string(paige_count)+".txt";
-            // Write file to SD card.
-            FileStream nFile { filename, "w" };
-            nFile.write(charArray, strLen);
+    if(millis() - paige_file_start_time > 3000){
+        sys.state = State::Idle;
+        // Conver std::strinf into unit8_t array for file saving.
+        paige_count = paige_count + 1;
+        unsigned int strLen = paige_file.length();
+        uint8_t charArray[strLen];
+        std::copy(paige_file.begin(),paige_file.end(),charArray);
+        // Name file
+        std::string filename = "/sd/"+std::to_string(paige_count)+".txt";
+        // Write file to SD card.
+        FileStream nFile { filename, "w" };
+        nFile.write(charArray, strLen);
+        log_info("Hello world! (" + std::to_string(paige_count)+ ")" );
 
-            log_info(std::to_string(paige_buttons[0]) + std::to_string(paige_buttons[1])+ std::to_string(paige_buttons[2]) + std::to_string(paige_buttons[3]) + std::to_string(paige_buttons[4])+ std::to_string(paige_buttons[5]) + std::to_string(paige_buttons[6]) + std::to_string(paige_buttons[7])+ std::to_string(paige_buttons[8]));
-            protocol_send_event(&macro1Event);
-            
-            for(int i = 0; i < 9; i++){
-                paige_buttons[i] = 0;
-            }
+        if(paige_buttons[0] == 0 && paige_buttons[1] == 0 && paige_buttons[2] == 0 && paige_buttons[3] == 0 && paige_buttons[4] == 0 && paige_buttons[5] == 0 && paige_buttons[6] == 0 && paige_buttons[7] == 0 && paige_buttons[8] == 0 && config->_control->paige_button_pressed() == 0){
+            protocol_send_event(&macro0Event); // Run macro for buzzer.
+        }
+        
+        for(int i = 0; i < 9; i++){
+            paige_buttons[i] = 0;
+        }
 
-            paige_flag = 0;
+        paige_file_start_time = millis();
 
     }
 
