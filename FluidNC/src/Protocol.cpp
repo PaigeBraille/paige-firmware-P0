@@ -1044,62 +1044,65 @@ std::string protocol_ascii(){  // Get ASCII equivalent
 }
 
 static void protocol_key1() { // Key 1 event
-    paige_pressed |= (1<<0);  // Set a bit to remember the button being down
+    // paige_pressed |= (1<<0);  // Set a bit to remember the button being down
     paige_buttons[0] = 1;
 }
 
 static void protocol_key2() { // Key 2 event
-    paige_pressed |= (1<<1);  // Set a bit to remember the button being down
+    // paige_pressed |= (1<<1);  // Set a bit to remember the button being down
     paige_buttons[1] = 1;
 }
 
 static void protocol_key3() { // Key 3 event
-    paige_pressed |= (1<<2);  // Set a bit to remember the button being down
+    // paige_pressed |= (1<<2);  // Set a bit to remember the button being down
     paige_buttons[2] = 1;
 }
 
 static void protocol_key4() { // Key 4 event
-    paige_pressed |= (1<<3);  // Set a bit to remember the button being down
+    // paige_pressed |= (1<<3);  // Set a bit to remember the button being down
     paige_buttons[3] = 1;
 }
 
 static void protocol_key5() { // Key 5 event
-    paige_pressed |= (1<<4);  // Set a bit to remember the button being down
+    // paige_pressed |= (1<<4);  // Set a bit to remember the button being down
     paige_buttons[4] = 1;
 }
 
 static void protocol_key6() { // Key 6 event
-    paige_pressed |= (1<<5);  // Set a bit to remember the button being down
+    // paige_pressed |= (1<<5);  // Set a bit to remember the button being down
     paige_buttons[5] = 1;
 }
 
 static void protocol_keyS() { // Space key event: records corded press.
-    if(paige_file_open == 1){
-        paige_file += protocol_ascii();
-        log_info("PAIGE:FILE:"+paige_file); // Send string to web-app.
-    }
-    paige_pressed = 0;
+    // if(paige_file_open == 1){
+    //     paige_file += protocol_ascii();
+    //     log_info("PAIGE:FILE:"+paige_file); // Send string to web-app.
+    // }
+    // paige_pressed = 0;
+    paige_buttons[6] = 1;
 }
 
 static void protocol_keyB() { // Backspace key event.
-    sys.state = State::Idle;
-    paige_restore_start_time = millis();
-    paige_backspace = 1;
-    if(paige_file_open == 1 & paige_file.length() != 0){
-        unsigned int strLen = paige_file.length();
-        paige_file.pop_back();
-        log_info("PAIGE:FILE:"+paige_file); // Send string to web-app.
-    }
+    // sys.state = State::Idle;
+    // paige_restore_start_time = millis();
+    // paige_backspace = 1;
+    // if(paige_file_open == 1 & paige_file.length() != 0){
+    //     unsigned int strLen = paige_file.length();
+    //     paige_file.pop_back();
+    //     log_info("PAIGE:FILE:"+paige_file); // Send string to web-app.
+    // }
+    paige_buttons[7] = 1;
 }
 
 static void protocol_keyN() { // New line key event.
-    sys.state = State::Idle;
-    paige_file_start_time = millis();
-    paige_newline = 1;
-    if(paige_file_open == 1){
-        paige_file += "A";
-        log_info("PAIGE:FILE:"+paige_file);  // Send string to web-app.
-    }
+    // sys.state = State::Idle;
+    // paige_file_start_time = millis();
+    // paige_newline = 1;
+    // if(paige_file_open == 1){
+    //     paige_file += "A";
+    //     log_info("PAIGE:FILE:"+paige_file);  // Send string to web-app.
+    // }
+    paige_buttons[8] = 1;
 }
 ArgEvent feedOverrideEvent { protocol_do_feed_override };
 ArgEvent rapidOverrideEvent { protocol_do_rapid_override };

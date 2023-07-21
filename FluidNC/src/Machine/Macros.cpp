@@ -5,6 +5,7 @@
 #include "src/Serial.h"                 // Cmd
 #include "src/System.h"                 // sys
 #include "src/Machine/MachineConfig.h"  // config
+#include "src/Paige.h"                  // flag
 
 void MacroEvent::run(void* arg) {
     if (sys.state != State::Idle) {
@@ -80,6 +81,10 @@ bool Macros::run_macro(size_t index) {
                     WebUI::inputBuffer.push(static_cast<uint8_t>(cmd));
                 }
                 i += 3;
+                break;
+            case 'Y':
+                paige_flag = 1;
+                paige_count = paige_count + 1;
                 break;
             default:
                 WebUI::inputBuffer.push(c);

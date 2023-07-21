@@ -157,58 +157,81 @@ static void gpio_send_action(int gpio_num, bool active) {
 void poll_gpios() {
     // PAIGE: New line and buzzer.
     // Clear new line and back space if short press.
-    if(!config->_control->paige_new_line()){ 
-        paige_newline = 0; 
+    if(paige_flag == 1){
+            // Conver std::strinf into unit8_t array for file saving.
+            unsigned int strLen = paige_file.length();
+            uint8_t charArray[strLen];
+            std::copy(paige_file.begin(),paige_file.end(),charArray);
+            // Name file
+            std::string filename = "/sd/"+std::to_string(paige_count)+".txt";
+            // Write file to SD card.
+            FileStream nFile { filename, "w" };
+            nFile.write(charArray, strLen);
+
+            log_info(std::to_string(paige_buttons[0]) + std::to_string(paige_buttons[1])+ std::to_string(paige_buttons[2]) + std::to_string(paige_buttons[3]) + std::to_string(paige_buttons[4])+ std::to_string(paige_buttons[5]) + std::to_string(paige_buttons[6]) + std::to_string(paige_buttons[7])+ std::to_string(paige_buttons[8]));
+            protocol_send_event(&macro1Event);
+            
+            for(int i = 0; i < 9; i++){
+                paige_buttons[i] = 0;
+            }
+
+            paige_flag = 0;
+
+    }
+
+
+    // if(!config->_control->paige_new_line()){ 
+    //     paige_newline = 0; 
         
-    } 
-    if(!config->_control->paige_backspace()){ 
-        paige_backspace = 0; 
-    } 
-    // Open file
-    if(millis()-paige_file_start_time > 1000 && paige_newline == 1 && paige_file_open == 0 && config->_control->paige_new_line()){ // Open file. 
-        paige_file_open = 1;
-        paige_newline = 0;
-        paige_file = "";
+    // } 
+    // if(!config->_control->paige_backspace()){ 
+    //     paige_backspace = 0; 
+    // } 
+    // // Open file
+    // if(millis()-paige_file_start_time > 1000 && paige_newline == 1 && paige_file_open == 0 && config->_control->paige_new_line()){ // Open file. 
+    //     paige_file_open = 1;
+    //     paige_newline = 0;
+    //     paige_file = "";
 
-        log_info("PAIGE:FILE:"+paige_file); // Send string to web-app.
-        log_info("FILE OPENED");         
-        protocol_send_event(&macro0Event); // Run macro for buzzer.
-    }
-    // Close file
-    else if(millis()-paige_file_start_time > 1000 && paige_newline == 1 && paige_file_open == 1 && config->_control->paige_new_line()){ // Close and save file. 
-        paige_file_open = 0;
-        paige_newline   = 0;
+    //     log_info("PAIGE:FILE:"+paige_file); // Send string to web-app.
+    //     log_info("FILE OPENED");         
+    //     protocol_send_event(&macro0Event); // Run macro for buzzer.
+    // }
+    // // Close file
+    // else if(millis()-paige_file_start_time > 1000 && paige_newline == 1 && paige_file_open == 1 && config->_control->paige_new_line()){ // Close and save file. 
+    //     paige_file_open = 0;
+    //     paige_newline   = 0;
 
-        // Replace "A" by "\n" before storing a completed file.
-        std::string x = "A", y = "\n", j = "B", k =":";
-        size_t pos;
-        while ((pos = paige_file.find(x)) != std::string::npos) {
-            paige_file.replace(pos, 1, y);
-        }
-        while ((pos = paige_file.find(j)) != std::string::npos) {
-            paige_file.replace(pos, 1, k);
-        }
-        // Conver std::strinf into unit8_t array for file saving.
-        unsigned int strLen = paige_file.length();
-        uint8_t charArray[strLen];
-        std::copy(paige_file.begin(),paige_file.end(),charArray);
-        // Name file
-        int nl = paige_file.find('\n',0);
-        std::string filename = "/sd/" + paige_file.substr(0,nl) + ".brf";
-        // Write file to SD card.
-        FileStream nFile { filename, "w" };
-        nFile.write(charArray, strLen);
-        log_info("FILE CLOSED");
-        protocol_send_event(&macro1Event);
-    }
-    // Restore settings
-    if(millis()-paige_restore_start_time > 5000 && paige_backspace == 1){  
-        paige_backspace = 0;
+    //     // Replace "A" by "\n" before storing a completed file.
+    //     std::string x = "A", y = "\n", j = "B", k =":";
+    //     size_t pos;
+    //     while ((pos = paige_file.find(x)) != std::string::npos) {
+    //         paige_file.replace(pos, 1, y);
+    //     }
+    //     while ((pos = paige_file.find(j)) != std::string::npos) {
+    //         paige_file.replace(pos, 1, k);
+    //     }
+    //     // Conver std::strinf into unit8_t array for file saving.
+    //     unsigned int strLen = paige_file.length();
+    //     uint8_t charArray[strLen];
+    //     std::copy(paige_file.begin(),paige_file.end(),charArray);
+    //     // Name file
+    //     int nl = paige_file.find('\n',0);
+    //     std::string filename = "/sd/" + paige_file.substr(0,nl) + ".brf";
+    //     // Write file to SD card.
+    //     FileStream nFile { filename, "w" };
+    //     nFile.write(charArray, strLen);
+    //     log_info("FILE CLOSED");
+    //     protocol_send_event(&macro1Event);
+    // }
+    // // Restore settings
+    // if(millis()-paige_restore_start_time > 5000 && paige_backspace == 1){  
+    //     paige_backspace = 0;
 
-        log_info("Restoring settings");
-        WebUI::wifi_config.reset_settings();
-        WebUI::COMMANDS::restart_MCU();          
-    }
+    //     log_info("Restoring settings");
+    //     WebUI::wifi_config.reset_settings();
+    //     WebUI::COMMANDS::restart_MCU();          
+    // }
 
     // FluidNC
     gpio_mask_t gpios_active  = get_gpios();
