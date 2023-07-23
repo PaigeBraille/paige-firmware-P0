@@ -15,3 +15,5 @@ extern int paige_file_open;
 extern int paige_file_closed;
 extern std::string paige_file;
 extern std::string paige_file_send;
+
+extern std::string illegal_chars;

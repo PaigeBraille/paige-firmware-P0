@@ -18,3 +18,4 @@ int paige_file_open                   = 0;
 int paige_file_closed                 = 1;
 std::string paige_file              = " ";
 std::string paige_file_send         = " ";
+std::string illegal_chars  = "\\/:?\"<>|";

@@ -154,6 +154,16 @@ static void gpio_send_action(int gpio_num, bool active) {
     }
 }
 
+// void remove_illegal_chars(std::string s)
+// {
+//     size_t pos;
+//     for (std::string::size_type i = 0; i < illegal_chars.size(); i++) {
+//         while ((pos = paige_file.find(illegal_chars[i])) != std::string::npos) {
+//             paige_file.replace(pos, 1, " ");
+//         }
+//     }
+// }
+
 void poll_gpios() {
     // PAIGE: New line and buzzer.
     // Clear new line and back space if short press.
@@ -188,13 +198,18 @@ void poll_gpios() {
         while ((pos = paige_file.find(j)) != std::string::npos) {
             paige_file.replace(pos, 1, k);
         }
+
         // Conver std::strinf into unit8_t array for file saving.
         unsigned int strLen = paige_file.length();
         uint8_t charArray[strLen];
         std::copy(paige_file.begin(),paige_file.end(),charArray);
         // Name file
         int nl = paige_file.find('\n',0);
+        
         std::string filename = "/sd/" + paige_file.substr(0,nl) + ".brf";
+        while ((pos = filename.find('"')) != std::string::npos) {
+            filename.replace(pos, 1, " ");
+        }
         // Write file to SD card.
         FileStream nFile { filename, "w" };
         nFile.write(charArray, strLen);
