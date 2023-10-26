@@ -8,7 +8,7 @@
 struct SoftwarePin {
     SoftwarePin() : callback(), argument(nullptr), mode(0), driverValue(false), padValue(false), pinMode(0) {}
 
-    void (*callback)(void*, bool v);
+    void (*callback)(void*);
     void* argument;
     int   mode;
 
@@ -16,7 +16,7 @@ struct SoftwarePin {
     bool padValue;
     int  pinMode;
 
-    void handleISR(bool nv) { callback(argument, nv); }
+    void handleISR() { callback(argument); }
 
     void reset() {
         callback    = nullptr;
@@ -56,17 +56,17 @@ struct SoftwarePin {
             switch (mode) {
                 case RISING:
                     if (!oldval && newval) {
-                        handleISR(true);
+                        handleISR();
                     }
                     break;
                 case FALLING:
                     if (oldval && !newval) {
-                        handleISR(false);
+                        handleISR();
                     }
                     break;
                 case CHANGE:
                     if (oldval != newval) {
-                        handleISR(!oldval && newval);
+                        handleISR();
                     }
                     break;
             }
@@ -128,13 +128,13 @@ public:
                 pins[index].handlePadChangeWithHystesis(value);
             }
         } else {
-            pins[index].handlePadChange(value);
+            pins[index].driverValue = value;
         }
     }
 
     bool read(int index) const { return pins[index].padValue; }
 
-    void attachISR(int index, void (*callback)(void* arg, bool v), void* arg, int mode) {
+    void attachISR(int index, void (*callback)(void* arg), void* arg, int mode) {
         auto& pin = pins[index];
         Assert(pin.mode == 0, "ISR mode should be 0 when attaching interrupt. Another interrupt is already attached.");
 

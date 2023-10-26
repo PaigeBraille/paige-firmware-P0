@@ -115,9 +115,6 @@ size_t UartChannel::timedReadBytes(char* buffer, size_t length, TickType_t timeo
     return length - remlen;
 }
 
-#if ARDUINO_USB_CDC_ON_BOOT
-// Don't make Uart0 the main channel
-#else
 UartChannel Uart0(true);  // Primary serial channel with LF to CRLF conversion
 
 void uartInit() {
@@ -125,4 +122,3 @@ void uartInit() {
     uart0->begin(BAUD_RATE, UartData::Bits8, UartStop::Bits1, UartParity::None);
     Uart0.init(uart0);
 }
-#endif

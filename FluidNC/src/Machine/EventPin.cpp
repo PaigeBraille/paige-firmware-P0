@@ -1,17 +1,16 @@
 #include "EventPin.h"
 
-#include "../Report.h"    // addPinReport
-#include "../Protocol.h"  // event_queue
-#include "../System.h"    // sys
+#include "src/Report.h"    // addPinReport
+#include "src/Protocol.h"  // event_queue
+#include "src/System.h"    // sys
 
 #include "Driver/fluidnc_gpio.h"
 
 namespace Machine {
     EventPin::EventPin(Event* event, const char* legend, Pin* pin) : _event(event), _legend(legend), _pin(pin) {}
-
     bool EventPin::get() { return _pin->read(); }
 
-    void EventPin::gpioAction(void* arg, bool active) {
+    void EventPin::gpioAction(int gpio_num, void* arg, bool active) {
         EventPin* obj = static_cast<EventPin*>(arg);
         obj->update(active);
         if (active) {
@@ -27,15 +26,10 @@ namespace Machine {
         _pin->report(_legend);
 
         auto attr = Pin::Attr::Input;
-        _pin->setAttr(attr | Pin::Attr::ISR);
-        _pin->attachInterrupt(gpioAction, 0x03 /* irrelevant */, this);
-
-        // _gpio = _pin->getNative(Pin::Capabilities::Input);
-        // gpio_set_action(_gpio, gpioAction, this, _pin->getAttr().has(Pin::Attr::ActiveLow));
+        _pin->setAttr(attr);
+        _gpio = _pin->getNative(Pin::Capabilities::Input);
+        gpio_set_action(_gpio, gpioAction, (void*)this, _pin->getAttr().has(Pin::Attr::ActiveLow));
     }
 
-    EventPin::~EventPin() {
-        _pin->detachInterrupt();
-        // gpio_clear_action(_gpio);
-    }
+    EventPin::~EventPin() { gpio_clear_action(_gpio); }
 };

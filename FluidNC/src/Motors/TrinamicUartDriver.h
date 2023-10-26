@@ -25,9 +25,7 @@ namespace MotorDrivers {
 
         bool hw_serial_init();
 
-        // TMC2208 and TMC2225 have a fixed addr = 0
-        // TMC2209 and TMC2226 configure these through MS1/MS2.
-        uint8_t _addr = 0;
+        uint8_t _addr;
 
         // Configuration handlers:
         void validate() override { StandardStepper::validate(); }
@@ -38,6 +36,7 @@ namespace MotorDrivers {
         }
 
         void group(Configuration::HandlerBase& handler) override {
+            handler.item("addr", _addr);
             handler.item("uart_num", _uart_num);
             TrinamicBase::group(handler);
         }

@@ -11,19 +11,15 @@
 #include "../CoolantControl.h"
 #include "../Kinematics/Kinematics.h"
 #include "../WebUI/BTConfig.h"
-#include "../Extenders/Extenders.h"
 #include "../Control.h"
 #include "../Probe.h"
-#include "../Parking.h"
+#include "src/Parking.h"
 #include "../SDCard.h"
 #include "../Spindles/Spindle.h"
 #include "../Stepping.h"
 #include "../Stepper.h"
 #include "../Config.h"
 #include "../OLED.h"
-#include "../UartChannel.h"
-#include "../Uart.h"
-#include "../Listeners/SysListener.h"
 #include "Axes.h"
 #include "SPIBus.h"
 #include "I2CBus.h"
@@ -61,24 +57,22 @@ namespace Machine {
     public:
         MachineConfig() = default;
 
-        Axes*                      _axes           = nullptr;
-        Kinematics*                _kinematics     = nullptr;
-        SPIBus*                    _spi            = nullptr;
-        I2CBus*                    _i2c[MAX_N_I2C] = { nullptr };
-        I2SOBus*                   _i2so           = nullptr;
-        Stepping*                  _stepping       = nullptr;
-        CoolantControl*            _coolant        = nullptr;
-        Probe*                     _probe          = nullptr;
-        Control*                   _control        = nullptr;
-        UserOutputs*               _userOutputs    = nullptr;
-        SDCard*                    _sdCard         = nullptr;
-        Macros*                    _macros         = nullptr;
-        Start*                     _start          = nullptr;
-        Parking*                   _parking        = nullptr;
-        OLED*                      _oled           = nullptr;
-        Listeners::SysListenerList _sysListeners;
-        Spindles::SpindleList      _spindles;
-        Extenders::Extenders*      _extenders = nullptr;
+        Axes*                 _axes           = nullptr;
+        Kinematics*           _kinematics     = nullptr;
+        SPIBus*               _spi            = nullptr;
+        I2CBus*               _i2c[MAX_N_I2C] = { nullptr };
+        I2SOBus*              _i2so           = nullptr;
+        Stepping*             _stepping       = nullptr;
+        CoolantControl*       _coolant        = nullptr;
+        Probe*                _probe          = nullptr;
+        Control*              _control        = nullptr;
+        UserOutputs*          _userOutputs    = nullptr;
+        SDCard*               _sdCard         = nullptr;
+        Macros*               _macros         = nullptr;
+        Start*                _start          = nullptr;
+        Parking*              _parking        = nullptr;
+        OLED*                 _oled           = nullptr;
+        Spindles::SpindleList _spindles;
 
         UartChannel* _uart_channels[MAX_N_UARTS] = { nullptr };
         Uart*        _uarts[MAX_N_UARTS]         = { nullptr };
@@ -88,7 +82,7 @@ namespace Machine {
         bool  _verboseErrors     = false;
         bool  _reportInches      = false;
 
-        int32_t _planner_blocks = 16;
+        size_t _planner_blocks = 16;
 
         // Enables a special set of M-code commands that enables and disables the parking motion.
         // These are controlled by `M56`, `M56 P1`, or `M56 Px` to enable and `M56 P0` to disable.

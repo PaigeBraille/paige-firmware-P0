@@ -244,22 +244,22 @@ static Error list_commands(const char* value, WebUI::AuthenticationLevel auth_le
     return Error::Ok;
 }
 static Error toggle_check_mode(const char* value, WebUI::AuthenticationLevel auth_level, Channel& out) {
-    if (sys.state() == State::ConfigAlarm) {
+    if (sys.state == State::ConfigAlarm) {
         return Error::ConfigurationInvalid;
     }
 
     // Perform reset when toggling off. Check g-code mode should only work when
     // idle and ready, regardless of alarm locks. This is mainly to keep things
     // simple and consistent.
-    if (sys.state() == State::CheckMode) {
+    if (sys.state == State::CheckMode) {
         log_debug("Check mode");
         mc_reset();
         report_feedback_message(Message::Disabled);
     } else {
-        if (sys.state() != State::Idle) {
+        if (sys.state != State::Idle) {
             return Error::IdleError;  // Requires no alarm mode.
         }
-        sys.set_state(State::CheckMode);
+        sys.state = State::CheckMode;
         report_feedback_message(Message::Enabled);
     }
     return Error::Ok;
@@ -278,16 +278,16 @@ static Error isStuck() {
     return Error::Ok;
 }
 static Error disable_alarm_lock(const char* value, WebUI::AuthenticationLevel auth_level, Channel& out) {
-    if (sys.state() == State::ConfigAlarm) {
+    if (sys.state == State::ConfigAlarm) {
         return Error::ConfigurationInvalid;
     }
-    if (sys.state() == State::Alarm) {
+    if (sys.state == State::Alarm) {
         Error err = isStuck();
         if (err != Error::Ok) {
             return err;
         }
         report_feedback_message(Message::AlarmUnlock);
-        sys.set_state(State::Idle);
+        sys.state = State::Idle;
 
         // Don't run startup script. Prevents stored moves in startup from causing accidents.
     }  // Otherwise, no effect.
@@ -311,7 +311,7 @@ static Error home(AxisMask axisMask) {
         }
     }
 
-    if (sys.state() == State::ConfigAlarm) {
+    if (sys.state == State::ConfigAlarm) {
         return Error::ConfigurationInvalid;
     }
     if (!Machine::Axes::homingMask) {
@@ -326,7 +326,7 @@ static Error home(AxisMask axisMask) {
 
     do {
         protocol_execute_realtime();
-    } while (sys.state() == State::Homing);
+    } while (sys.state == State::Homing);
 
     settings_execute_startup();
 
@@ -466,7 +466,7 @@ static Error restore_settings(const char* value, WebUI::AuthenticationLevel auth
 
 static Error showState(const char* value, WebUI::AuthenticationLevel auth_level, Channel& out) {
     const char* name;
-    const State state = sys.state();
+    const State state = sys.state;
     auto        it    = StateName.find(state);
     name              = it == StateName.end() ? "<invalid>" : it->second;
 
@@ -475,7 +475,7 @@ static Error showState(const char* value, WebUI::AuthenticationLevel auth_level,
 }
 
 static Error doJog(const char* value, WebUI::AuthenticationLevel auth_level, Channel& out) {
-    if (sys.state() == State::ConfigAlarm) {
+    if (sys.state == State::ConfigAlarm) {
         return Error::ConfigurationInvalid;
     }
 
@@ -498,7 +498,7 @@ static const char* alarmString(ExecAlarm alarmNumber) {
 }
 
 static Error listAlarms(const char* value, WebUI::AuthenticationLevel auth_level, Channel& out) {
-    if (sys.state() == State::ConfigAlarm) {
+    if (sys.state == State::ConfigAlarm) {
         log_to(out, "Configuration alarm is active. Check the boot messages for 'ERR'.");
     } else if (rtAlarm != ExecAlarm::None) {
         log_to(out, "Active alarm: ", int(rtAlarm) << " (" << alarmString(rtAlarm));
@@ -556,7 +556,7 @@ static Error listErrors(const char* value, WebUI::AuthenticationLevel auth_level
 }
 
 static Error motor_control(const char* value, bool disable) {
-    if (sys.state() == State::ConfigAlarm) {
+    if (sys.state == State::ConfigAlarm) {
         return Error::ConfigurationInvalid;
     }
 
@@ -716,71 +716,6 @@ static Error showGPIOs(const char* value, WebUI::AuthenticationLevel auth_level,
     return Error::Ok;
 }
 
-std::map<std::string, Pin*> pins;
-
-static Error setGPIOInput(const char* value, WebUI::AuthenticationLevel auth_level, Channel& out) {
-    if (pins.find(value) == pins.end()) {
-        Pin* thePin = new Pin(Pin::create(value));
-        pins[value] = thePin;
-    }
-
-    pins[value]->setAttr(Pin::Attr::Input);
-    log_info("Pin " << value << " set to input");
-
-    return Error::Ok;
-}
-
-static Error setGPIOOutput(const char* value, WebUI::AuthenticationLevel auth_level, Channel& out) {
-    if (pins.find(value) == pins.end()) {
-        Pin* thePin = new Pin(Pin::create(value));
-        pins[value] = thePin;
-    }
-
-    pins[value]->setAttr(Pin::Attr::Output);
-    log_info("Pin " << value << " set to output");
-
-    return Error::Ok;
-}
-
-static Error readGPIO(const char* value, WebUI::AuthenticationLevel auth_level, Channel& out) {
-    if (pins.find(value) == pins.end()) {
-        Pin* thePin = new Pin(Pin::create(value));
-        pins[value] = thePin;
-        thePin->setAttr(Pin::Attr::Input);
-    }
-
-    const auto v = pins[value]->read() ? "on" : "off";
-    log_info("Pin " << value << " reads " << v);
-
-    return Error::Ok;
-}
-
-static Error writeGPIOOn(const char* value, WebUI::AuthenticationLevel auth_level, Channel& out) {
-    if (pins.find(value) == pins.end()) {
-        Pin* thePin = new Pin(Pin::create(value));
-        pins[value] = thePin;
-        thePin->setAttr(Pin::Attr::Output);
-    }
-
-    pins[value]->synchronousWrite(true);
-    log_info("Pin " << value << " is on");
-
-    return Error::Ok;
-}
-
-static Error writeGPIOOff(const char* value, WebUI::AuthenticationLevel auth_level, Channel& out) {
-    if (pins.find(value) == pins.end()) {
-        Pin* thePin = new Pin(Pin::create(value));
-        pins[value] = thePin;
-        thePin->setAttr(Pin::Attr::Output);
-    }
-
-    pins[value]->synchronousWrite(0);
-    log_info("Pin " << value << " is off");
-
-    return Error::Ok;
-}
-
 static Error setReportInterval(const char* value, WebUI::AuthenticationLevel auth_level, Channel& out) {
     if (!value) {
         uint32_t actual = out.getReportInterval();
@@ -826,11 +761,6 @@ static Error showHeap(const char* value, WebUI::AuthenticationLevel auth_level, 
 // for decoding its own value string, if it needs one.
 void make_user_commands() {
     new UserCommand("GD", "GPIO/Dump", showGPIOs, anyState);
-    new UserCommand("GI", "GPIO/Input", setGPIOInput, anyState);
-    new UserCommand("GO", "GPIO/Output", setGPIOOutput, anyState);
-    new UserCommand("G+", "GPIO/On", writeGPIOOn, anyState);
-    new UserCommand("G-", "GPIO/Off", writeGPIOOff, anyState);
-    new UserCommand("GR", "GPIO/Read", readGPIO, anyState);
 
     new UserCommand("CI", "Channel/Info", showChannelInfo, anyState);
     new UserCommand("XR", "Xmodem/Receive", xmodem_receive, notIdleOrAlarm);
@@ -1087,7 +1017,7 @@ Error execute_line(char* line, Channel& channel, WebUI::AuthenticationLevel auth
         return settings_execute_line(line, channel, auth_level);
     }
     // Everything else is gcode. Block if in alarm or jog mode.
-    if (sys.state() == State::Alarm || sys.state() == State::ConfigAlarm || sys.state() == State::Jog) {
+    if (sys.state == State::Alarm || sys.state == State::ConfigAlarm || sys.state == State::Jog) {
         return Error::SystemGcLock;
     }
     Error result = gc_execute_line(line);

@@ -6,7 +6,7 @@
 #include "../MotionControl.h"
 #include "../Planner.h"
 #include "../Types.h"
-#include "../Machine/Homing.h"
+#include "src/Machine/Homing.h"
 
 /*
 Special types

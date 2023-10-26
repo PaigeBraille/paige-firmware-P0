@@ -15,7 +15,6 @@
 #    include "Protocol.h"
 #    include "System.h"
 #    include "UartChannel.h"
-#    include "USBCDCChannel.h"
 #    include "MotionControl.h"
 #    include "Platform.h"
 #    include "StartupLog.h"
@@ -29,17 +28,9 @@
 extern void make_user_commands();
 
 void setup() {
-    // auto dummyUart0 = new Uart(0);
-    // dummyUart0->_txd_pin = Pin::create("gpio.16");
-    // dummyUart0->_rxd_pin = Pin::create("gpio.17");
-    // dummyUart0->begin();
-
     disableCore0WDT();
     try {
-        // uartInit();       // Setup serial port
-
         timing_init();
-
         uartInit();       // Setup serial port
         Uart0.println();  // create some white space after ESP32 boot info
 
@@ -101,15 +92,6 @@ void setup() {
                 }
             }
 
-            // We have to initialize the extenders first, before pins are used
-            if (config->_extenders) {
-                config->_extenders->init();
-            }
-
-            for (auto s : config->_sysListeners) {
-                s->init();
-            }
-
             if (config->_oled) {
                 config->_oled->init();
             }
@@ -128,12 +110,12 @@ void setup() {
         }
 
         // Initialize system state.
-        if (sys.state() != State::ConfigAlarm) {
+        if (sys.state != State::ConfigAlarm) {
             if (FORCE_INITIALIZATION_ALARM) {
                 // Force ALARM state upon a power-cycle or hard reset.
-                sys.set_state(State::Alarm);
+                sys.state = State::Alarm;
             } else {
-                sys.set_state(State::Idle);
+                sys.state = State::Idle;
             }
 
             limits_init();
@@ -147,7 +129,7 @@ void setup() {
             // things uncontrollably. Very bad.
             if (config->_start->_mustHome && Machine::Axes::homingMask) {
                 // If there is an axis with homing configured, enter Alarm state on startup
-                sys.set_state(State::Alarm);
+                sys.state = State::Alarm;
             }
             for (auto s : config->_spindles) {
                 s->init();
@@ -161,7 +143,7 @@ void setup() {
     } catch (const AssertionFailed& ex) {
         // This means something is terribly broken:
         log_error("Critical error in main_init: " << ex.what());
-        sys.set_state(State::ConfigAlarm);
+        sys.state = State::ConfigAlarm;
     }
 
     if (!WebUI::wifi_config.begin()) {
@@ -171,12 +153,6 @@ void setup() {
 }
 
 static void reset_variables() {
-    if (config) {
-        for (auto it : config->_sysListeners) {
-            it->beforeVariableReset();
-        }
-    }
-
     // Reset primary systems.
     system_reset();
     protocol_reset();
@@ -188,7 +164,7 @@ static void reset_variables() {
 
     plan_reset();  // Clear block buffer and planner variables
 
-    if (sys.state() != State::ConfigAlarm) {
+    if (sys.state != State::ConfigAlarm) {
         if (spindle) {
             spindle->stop();
             report_ovr_counter = 0;  // Set to report change immediately
@@ -202,12 +178,6 @@ static void reset_variables() {
     allChannels.flushRx();
     report_init_message(allChannels);
     mc_init();
-
-    if (config) {
-        for (auto it : config->_sysListeners) {
-            it->afterVariableReset();
-        }
-    }
 }
 
 void loop() {
@@ -233,10 +203,10 @@ void loop() {
         // to avoid memory leaks. It is probably worth doing eventually.
         log_error("Critical error in run_once: " << ex.msg);
         log_error("Stacktrace: " << ex.stackTrace);
-        sys.set_state(State::ConfigAlarm);
+        sys.state = State::ConfigAlarm;
     }
     // sys.abort is a user-initiated exit via ^x so we don't limit the number of occurrences
-    if (!sys.abort() && ++tries > 1) {
+    if (!sys.abort && ++tries > 1) {
         log_info("Stalling due to too many failures");
         while (1) {}
     }

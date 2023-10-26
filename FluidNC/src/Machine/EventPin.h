@@ -1,17 +1,19 @@
 #pragma once
 
-#include "../Pin.h"
-#include "../Event.h"
-#include "../Config.h"
+#include "src/Pin.h"
+#include "src/Event.h"
+#include "src/Config.h"
 
 namespace Machine {
     class EventPin {
     protected:
-        static void gpioAction(void*, bool);
+        static void gpioAction(int, void*, bool);
 
         Event* _event = nullptr;  // Subordinate event that is called conditionally
 
         pinnum_t _gpio;
+
+        static bool inactive(EventPin* pin);
 
     public:
         std::string _legend;  // The name that appears in init() messages and the name of the configuration item
@@ -29,6 +31,6 @@ namespace Machine {
 
         virtual void update(bool state) {};
 
-        virtual ~EventPin();
+        ~EventPin();
     };
 };

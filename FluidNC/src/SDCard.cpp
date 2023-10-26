@@ -9,7 +9,7 @@
 #include "Report.h"
 
 #include "Driver/sdspi.h"
-#include "SettingsDefinitions.h"
+#include "src/SettingsDefinitions.h"
 #include "FluidPath.h"
 
 SDCard::SDCard() : _state(State::Idle) {}

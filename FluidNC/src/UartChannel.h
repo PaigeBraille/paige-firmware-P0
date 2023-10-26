@@ -42,14 +42,6 @@ public:
     void group(Configuration::HandlerBase& handler) override { handler.item("uart_num", _uart_num); }
 };
 
-#ifndef ARDUINO_USB_CDC_ON_BOOT
-#    define ARDUINO_USB_CDC_ON_BOOT 0
-#endif
-
-#if ARDUINO_USB_CDC_ON_BOOT  //Serial used for USB CDC
-// We don't want uart0 as channel
-#else
 extern UartChannel Uart0;
 
 extern void uartInit();
-#endif

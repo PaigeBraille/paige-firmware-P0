@@ -8,13 +8,13 @@
 
 namespace Machine {
 
-    int Stepping::_engine = TIMED; // RMT;
+    int Stepping::_engine = RMT;
 
     EnumItem stepTypes[] = { { Stepping::TIMED, "Timed" },
-                             // { Stepping::RMT, "RMT" },
+                             { Stepping::RMT, "RMT" },
                              { Stepping::I2S_STATIC, "I2S_static" },
                              { Stepping::I2S_STREAM, "I2S_stream" },
-                             EnumItem(Stepping::TIMED) };
+                             EnumItem(Stepping::RMT) };
 
     void Stepping::init() {
         log_info("Stepping:" << stepTypes[_engine].name << " Pulse:" << _pulseUsecs << "us Dsbl Delay:" << _disableDelayUsecs
@@ -74,7 +74,7 @@ namespace Machine {
                 i2s_out_push_sample(_directionDelayUsecs);
             } else if (_engine == stepper_id_t::I2S_STATIC) {
                 // Commit the pin changes to the hardware immediately
-                config->_i2so->push();
+                i2s_out_push();
                 delay_us(_directionDelayUsecs);
             } else if (_engine == stepper_id_t::TIMED) {
                 // If we are using RMT, we can't delay here.
@@ -90,7 +90,7 @@ namespace Machine {
             // Generate the number of pulses needed to span pulse_microseconds
             i2s_out_push_sample(_pulseUsecs);
         } else if (_engine == stepper_id_t::I2S_STATIC) {
-            config->_i2so->push();
+            i2s_out_push();
             _stepPulseEndTime = usToEndTicks(_pulseUsecs);
         } else if (_engine == stepper_id_t::TIMED) {
             _stepPulseEndTime = usToEndTicks(_pulseUsecs);
@@ -100,7 +100,7 @@ namespace Machine {
     // Called only from Axes::unstep()
     void IRAM_ATTR Stepping::finishPulse() {
         if (_engine == stepper_id_t::I2S_STATIC) {
-            config->_i2so->push();
+            i2s_out_push();
         }
     }
 
@@ -161,8 +161,8 @@ namespace Machine {
             case stepper_id_t::I2S_STREAM:
             case stepper_id_t::I2S_STATIC:
                 return i2s_out_max_steps_per_sec;
-            // case stepper_id_t::RMT:
-            //     return 1000000 / (2 * _pulseUsecs + _directionDelayUsecs);
+            case stepper_id_t::RMT:
+                return 1000000 / (2 * _pulseUsecs + _directionDelayUsecs);
             case stepper_id_t::TIMED:
             default:
                 return 80000;  // based on testing

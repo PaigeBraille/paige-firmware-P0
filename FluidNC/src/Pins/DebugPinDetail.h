@@ -14,14 +14,14 @@ namespace Pins {
         bool     _isHigh;
 
         struct CallbackHandler {
-            void (*callback)(void* arg, bool v);
+            void (*callback)(void* arg);
             void*           argument;
             DebugPinDetail* _myPin;
 
-            static void handle(void* arg, bool v);
+            static void handle(void* arg);
         } _isrHandler;
 
-        friend void CallbackHandler::handle(void* arg, bool v);
+        friend void CallbackHandler::handle(void* arg);
 
         bool shouldEvent();
 
@@ -39,7 +39,7 @@ namespace Pins {
         PinAttributes getAttr() const override;
 
         // ISR's:
-        void attachInterrupt(void (*callback)(void*, bool), void* arg, int mode) override;
+        void attachInterrupt(void (*callback)(void*), void* arg, int mode) override;
         void detachInterrupt() override;
 
         std::string toString() override { return _implementation->toString(); }

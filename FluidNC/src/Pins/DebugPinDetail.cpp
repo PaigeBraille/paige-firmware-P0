@@ -4,7 +4,6 @@
 #include "DebugPinDetail.h"
 
 #include "../UartChannel.h"
-#include "../USBCDCChannel.h"
 #include <esp32-hal.h>  // millis()
 #include <cstdio>       // vsnprintf
 #include <cstdarg>
@@ -74,16 +73,16 @@ namespace Pins {
 
     PinAttributes DebugPinDetail::getAttr() const { return _implementation->getAttr(); }
 
-    void DebugPinDetail::CallbackHandler::handle(void* arg, bool v) {
+    void DebugPinDetail::CallbackHandler::handle(void* arg) {
         auto handler = static_cast<CallbackHandler*>(arg);
         if (handler->_myPin->shouldEvent()) {
             WriteSerial("Received ISR on %s", handler->_myPin->toString());
         }
-        handler->callback(handler->argument, v);
+        handler->callback(handler->argument);
     }
 
     // ISR's:
-    void DebugPinDetail::attachInterrupt(void (*callback)(void*, bool), void* arg, int mode) {
+    void DebugPinDetail::attachInterrupt(void (*callback)(void*), void* arg, int mode) {
         _isrHandler._myPin   = this;
         _isrHandler.argument = arg;
         _isrHandler.callback = callback;

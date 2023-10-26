@@ -10,8 +10,6 @@
 #include "Axes.h"
 
 namespace Machine {
-    Motor::Motor(int axis, int motorNum) : _axis(axis), _motorNum(motorNum) {}
-
     void Motor::group(Configuration::HandlerBase& handler) {
         handler.item("limit_neg_pin", _negPin);
         handler.item("limit_pos_pin", _posPin);
@@ -28,8 +26,6 @@ namespace Machine {
     }
 
     void Motor::init() {
-        log_debug("Initializing motor / limits...");
-
         if (strcmp(_driver->name(), "null_motor") != 0) {
             set_bitnum(Machine::Axes::motorMask, Machine::Axes::motor_bit(_axis, _motorNum));
         }

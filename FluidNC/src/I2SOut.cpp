@@ -1,15 +1,7 @@
 // Copyright (c) 2018 - Simon Jouet
 // Copyright (c) 2020 - Michiyasu Odaki
 // Copyright (c) 2020 -	Mitch Bradley
-//
 // Use of this source code is governed by a GPLv3 license that can be found in the LICENSE file.
-//
-// Where does all this shit come from? tools\sdk\esp32s2\include\hal\esp32s2\include\hal\i2s_ll.h
-// I noticed all the bloody calls here. It's a real PITA if you don't know, and the file doesn't want
-// to be included... so here we go.
-//
-// Another good source: https://github.com/espressif/esp-idf/blob/6cfa88ed49b7d1209732347dae55578f4a679c98/components/driver/i2s/i2s_common.c
-// has a lot of HAL calls.
 
 #include "I2SOut.h"
 
@@ -22,21 +14,11 @@
 uint8_t i2s_out_read(pinnum_t pin) {
     return 0;
 }
-void i2s_out_write(pinnum_t pin, uint8_t val) {
-    Assert(false, "I2SO stream is not supported on this hardware");
-}
-void i2s_out_push_sample(uint32_t usec) {
-    Assert(false, "I2SO stream is not supported on this hardware");
-}
-void i2s_out_push() {
-    Assert(false, "I2SO stream is not supported on this hardware");
-}
-void i2s_out_delay() {
-    Assert(false, "I2SO stream is not supported on this hardware");
-}
-int i2s_out_set_passthrough() {
-    Assert(false, "I2SO stream is not supported on this hardware");
-
+void i2s_out_write(pinnum_t pin, uint8_t val) {}
+void i2s_out_push_sample(uint32_t usec) {}
+void i2s_out_push() {}
+void i2s_out_delay() {}
+int  i2s_out_set_passthrough() {
     return 0;
 }
 i2s_out_pulser_status_t i2s_out_get_pulser_status() {
@@ -62,11 +44,15 @@ int i2s_out_init() {
 #    include "Machine/MachineConfig.h"
 #    include "Stepper.h"
 
-#    include <esp_private/i2s_platform.h>
-#    include <esp_private/esp_clk.h>
-#    include <esp_private/gdma.h>
+#    include <esp_attr.h>  // IRAM_ATTR
 
-#    include <soc/gdma_channel.h>
+#    include <freertos/FreeRTOS.h>
+#    include <driver/periph_ctrl.h>
+#    include <rom/lldesc.h>
+#    include <soc/i2s_struct.h>
+#    include <freertos/queue.h>
+#    include <soc/gpio_periph.h>
+#    include "Driver/fluidnc_gpio.h"
 
 // The <atomic> library routines are not in IRAM so they can crash when called from FLASH
 // The GCC intrinsic versions which are prefixed with __ are compiled inline
@@ -89,54 +75,6 @@ static uint32_t i2s_out_port_data = 0;
 static std::atomic<std::uint32_t> i2s_out_port_data = ATOMIC_VAR_INIT(0);
 
 #    endif
-
-// Make Arduino functions available
-extern "C" void __digitalWrite(pinnum_t pin, uint8_t val);
-
-// Well yuck.
-
-#    include "hal/gdma_hal.h"
-
-typedef struct gdma_platform_t   gdma_platform_t;
-typedef struct gdma_group_t      gdma_group_t;
-typedef struct gdma_pair_t       gdma_pair_t;
-typedef struct gdma_channel_t    gdma_channel_t;
-typedef struct gdma_tx_channel_t gdma_tx_channel_t;
-typedef struct gdma_rx_channel_t gdma_rx_channel_t;
-
-struct gdma_platform_t {
-    portMUX_TYPE  spinlock;                           // platform level spinlock
-    gdma_group_t* groups[SOC_GDMA_GROUPS];            // array of GDMA group instances
-    int           group_ref_counts[SOC_GDMA_GROUPS];  // reference count used to protect group install/uninstall
-};
-
-struct gdma_group_t {
-    int                group_id;                                   // Group ID, index from 0
-    gdma_hal_context_t hal;                                        // HAL instance is at group level
-    portMUX_TYPE       spinlock;                                   // group level spinlock
-    gdma_pair_t*       pairs[SOC_GDMA_PAIRS_PER_GROUP];            // handles of GDMA pairs
-    int                pair_ref_counts[SOC_GDMA_PAIRS_PER_GROUP];  // reference count used to protect pair install/uninstall
-};
-
-struct gdma_pair_t {
-    gdma_group_t*      group;    // which group the pair belongs to
-    int                pair_id;  // Pair ID, index from 0
-    gdma_tx_channel_t* tx_chan;  // pointer of tx channel in the pair
-    gdma_rx_channel_t* rx_chan;  // pointer of rx channel in the pair
-    int occupy_code;  // each bit indicates which channel has been occupied (an occupied channel will be skipped during channel search)
-    portMUX_TYPE spinlock;  // pair level spinlock
-};
-
-struct gdma_channel_t {
-    gdma_pair_t*             pair;             // which pair the channel belongs to
-    intr_handle_t            intr;             // per-channel interrupt handle
-    portMUX_TYPE             spinlock;         // channel level spinlock
-    gdma_channel_direction_t direction;        // channel direction
-    int                      periph_id;        // Peripheral instance ID, indicates which peripheral is connected to this GDMA channel
-    size_t                   sram_alignment;   // alignment for memory in SRAM
-    size_t                   psram_alignment;  // alignment for memory in PSRAM
-    esp_err_t (*del)(gdma_channel_t* channel);  // channel deletion function, it's polymorphic, see `gdma_del_tx_channel` or `gdma_del_rx_channel`
-};
 
 //
 // Configrations for DMA connected I2S
@@ -166,8 +104,8 @@ typedef struct {
     xQueueHandle queue;
 } i2s_out_dma_t;
 
-static i2s_out_dma_t         o_dma;
-static gdma_channel_handle_t i2s_out_isr_handle;
+static i2s_out_dma_t o_dma;
+static intr_handle_t i2s_out_isr_handle;
 
 // inner lock
 static portMUX_TYPE i2s_out_spinlock = portMUX_INITIALIZER_UNLOCKED;
@@ -252,13 +190,10 @@ void IRAM_ATTR i2s_out_push() {
 }
 
 static inline void i2s_out_reset_fifo_without_lock() {
-    // i2s_ll_rx_reset_fifo
-    // i2s_ll_tx_reset_fifo
-
-    I2S0.rx_conf.rx_fifo_reset = 1;
-    I2S0.rx_conf.rx_fifo_reset = 0;
-    I2S0.tx_conf.tx_fifo_reset = 1;
-    I2S0.tx_conf.tx_fifo_reset = 0;
+    I2S0.conf.rx_fifo_reset = 1;
+    I2S0.conf.rx_fifo_reset = 0;
+    I2S0.conf.tx_fifo_reset = 1;
+    I2S0.conf.tx_fifo_reset = 0;
 }
 
 static int i2s_clear_dma_buffer(lldesc_t* dma_desc, uint32_t port_data) {
@@ -290,7 +225,7 @@ static int i2s_clear_o_dma_buffers(uint32_t port_data) {
 
 static int i2s_out_gpio_attach(pinnum_t ws, pinnum_t bck, pinnum_t data) {
     // Route the i2s pins to the appropriate GPIO
-    gpio_matrix_out_check(data, I2S0O_SD_OUT_IDX, 0, 0);
+    gpio_matrix_out_check(data, I2S0O_DATA_OUT23_IDX, 0, 0);
     gpio_matrix_out_check(bck, I2S0O_BCK_OUT_IDX, 0, 0);
     gpio_matrix_out_check(ws, I2S0O_WS_OUT_IDX, 0, 0);
     return 0;
@@ -319,14 +254,14 @@ static int i2s_out_gpio_shiftout(uint32_t port_data) {
 
 static int i2s_out_stop() {
     I2S_OUT_ENTER_CRITICAL();
+    // Stop FIFO DMA
+    I2S0.out_link.stop = 1;
 
-    // i2s_common -> i2s_tx_channel_stop
-    I2S0.tx_conf.tx_start = 0;
-    gdma_stop(i2s_out_isr_handle);
+    // Disconnect DMA from FIFO
+    I2S0.fifo_conf.dscr_en = 0;  //Unset this bit to disable I2S DMA mode. (R/W)
 
     // stop TX module
-    // i2s_ll -> i2s_ll_tx_stop
-    I2S0.tx_conf.tx_start = 0;
+    I2S0.conf.tx_start = 0;
 
     // Force WS to LOW before detach
     // This operation prevents unintended WS edge trigger when detach
@@ -344,70 +279,11 @@ static int i2s_out_stop() {
     uint32_t port_data = ATOMIC_LOAD(&i2s_out_port_data);  // current expanded port value
     i2s_out_gpio_shiftout(port_data);
 
-    //clear pending interrupt -> not needed for GDMA according to i2s_legacy.c.
-    // I2S0.int_clr.val = I2S0.int_st.val; is from i2s_ll_clear_intr_status
+    //clear pending interrupt
+    I2S0.int_clr.val = I2S0.int_st.val;
 
     I2S_OUT_EXIT_CRITICAL();
     return 0;
-}
-
-//
-// I2S out DMA Interrupts handler
-//
-
-// I2SCommon -> static bool IRAM_ATTR i2s_dma_tx_callback(gdma_channel_handle_t dma_chan, gdma_event_data_t *event_data, void *user_data)
-// https://github.com/espressif/esp-idf/blob/96b0cb2828fb550ab0fe5cc7a5b3ac42fb87b1d2/components/driver/deprecated/i2s_legacy.c line 190-ish.
-static bool IRAM_ATTR i2s_out_intr_handler(gdma_channel_handle_t dma_chan, gdma_event_data_t* event_data, void* user_data) {
-    // static void IRAM_ATTR i2s_out_intr_handler(void* arg) {
-
-    i2s_out_dma_t* handle                    = (i2s_out_dma_t*)user_data;
-    lldesc_t*      finish_desc               = (lldesc_t*)(event_data->tx_eof_desc_addr);
-    portBASE_TYPE  high_priority_task_awoken = pdFALSE;
-    portBASE_TYPE  tmp                       = pdFALSE;
-
-    // if (dma_chan->int_st.out_eof || dma_chan->int_st.out_total_eof) {
-    // if (dma_chan->int_st.out_total_eof) {
-    //     // This is tail of the DMA descriptors
-    //     I2S_OUT_ENTER_CRITICAL_ISR();
-    //
-    //     // Stop TX module
-    //     I2S0.tx_conf.tx_start = 0;
-    //     gdma_stop(i2s_out_isr_handle);
-    //
-    //     // Disconnect DMA from FIFO
-    //     I2S_OUT_EXIT_CRITICAL_ISR();
-    // }
-
-    // Get the descriptor of the last item in the linkedlist
-    // finish_desc = (lldesc_t*)I2S0.out_eof_des_addr;
-
-    // If the queue is full it's because we have an underflow,
-    // more than buf_count isr without new data, remove the front buffer
-    if (xQueueIsQueueFullFromISR(o_dma.queue)) {
-        lldesc_t* front_desc;
-
-        // Remove a descriptor from the DMA complete event queue
-        xQueueReceiveFromISR(o_dma.queue, &front_desc, &tmp);
-        I2S_OUT_PULSER_ENTER_CRITICAL_ISR();
-        uint32_t port_data = 0;
-        if (i2s_out_pulser_status == STEPPING) {
-            port_data = ATOMIC_LOAD(&i2s_out_port_data);
-        }
-        I2S_OUT_PULSER_EXIT_CRITICAL_ISR();
-        for (int i = 0; i < DMA_SAMPLE_COUNT; i++) {
-            front_desc->buf[i] = port_data;
-        }
-        front_desc->length = I2S_OUT_DMABUF_LEN;
-    }
-
-    // Send a DMA complete event to the I2S bitstreamer task with finished buffer
-    xQueueSendFromISR(o_dma.queue, &finish_desc, &high_priority_task_awoken);
-    high_priority_task_awoken |= tmp;
-    // }
-
-    // clear interrupt
-    // dma_chan->int_clr.val = dma_chan->int_st.val;  //clear pending interrupt
-    return high_priority_task_awoken != pdFALSE;
 }
 
 static int i2s_out_start() {
@@ -423,129 +299,44 @@ static int i2s_out_start() {
     // Attach I2S to specified GPIO pin
     i2s_out_gpio_attach(i2s_out_ws_pin, i2s_out_bck_pin, i2s_out_data_pin);
 
-    // Reset TX/RX module
-    // i2s_ll_tx_reset
-    I2S0.tx_conf.tx_reset = 1;
-    I2S0.tx_conf.tx_reset = 0;
-    // i2s_ll_rx_reset
-    I2S0.rx_conf.rx_reset = 1;
-    I2S0.rx_conf.rx_reset = 0;
+    // reest TX/RX module
+    I2S0.conf.tx_reset = 1;
+    I2S0.conf.tx_reset = 0;
+    I2S0.conf.rx_reset = 1;
+    I2S0.conf.rx_reset = 0;
 
-    // Reset DMA. i2s_legacy -> i2s_tx_reset
-    //
-    // p_i2s[i2s_num]->tx->curr_ptr = NULL;
-    // I2S0.tx->curr_ptr = nullptr;
-    // p_i2s[i2s_num]->tx->rw_pos = 0;
-    // I2S0.tx->rw_pos = 0;
+    // reset DMA
+    I2S0.lc_conf.in_rst  = 1;
+    I2S0.lc_conf.in_rst  = 0;
+    I2S0.lc_conf.out_rst = 1;
+    I2S0.lc_conf.out_rst = 0;
 
-    // i2s_hal_tx_reset(&(p_i2s[i2s_num]->hal));
-    I2S0.tx_conf.tx_reset = 1;
-    I2S0.tx_conf.tx_reset = 0;
-
-    // DMA reset:
-    gdma_reset(i2s_out_isr_handle);
-    // i2s_hal_tx_reset_fifo(&(p_i2s[i2s_num]->hal));
-    I2S0.tx_conf.tx_fifo_reset = 1;
-    I2S0.tx_conf.tx_fifo_reset = 0;
-
-    // // i2s_ll_rx_reset_dma
-    // I2S0.lc_conf.in_rst = 1;
-    // I2S0.lc_conf.in_rst = 0;
-    // // i2s_ll_tx_reset_dma
-    // I2S0.lc_conf.out_rst = 1;
-    // I2S0.lc_conf.out_rst = 0;
-
-    // Configure TX DMA descriptor address and start TX DMA
-    // i2s_legacy -> i2s_tx_start()
-    // tx->desc[0] is apparently o_dma.desc[0].
-    gdma_start(i2s_out_isr_handle, (uint32_t)o_dma.desc[0] /*I2S0.tx->desc[0] */);
-    // #else
-    //         i2s_ll_tx_enable_dma(&(p_i2s[i2s_num]->hal));
-    //         i2s_ll_tx_enable_intr(&(p_i2s[i2s_num]->hal));
-    //         i2s_ll_tx_start_link(&(p_i2s[i2s_num]->hal), (uint32_t)p_i2s[i2s_num]->tx->desc[0]);
-    // #endif
-
-    // i2s_ll_tx_start(&(p_i2s[i2s_num]->hal));
-    I2S0.tx_conf.tx_update = 0;
-    I2S0.tx_conf.tx_update = 1;
-    I2S0.tx_conf.tx_start  = 1;
-
-    //
-    // I2S0.out_link.addr = (uint32_t)o_dma.desc[0];
+    I2S0.out_link.addr = (uint32_t)o_dma.desc[0];
 
     // reset FIFO
     i2s_out_reset_fifo_without_lock();
 
     // start DMA link
     if (i2s_out_pulser_status == PASSTHROUGH) {
-        I2S0.tx_conf.tx_chan_mod = 3;
-        // I2S0.conf_chan.tx_chan_mod = 3;  // 3:right+constant 4:left+constant (when tx_msb_right = 1)
-        I2S0.conf_single_data = port_data;
+        I2S0.conf_chan.tx_chan_mod = 3;  // 3:right+constant 4:left+constant (when tx_msb_right = 1)
+        I2S0.conf_single_data      = port_data;
     } else {
-        I2S0.tx_conf.tx_chan_mod = 4;
-        // I2S0.conf_chan.tx_chan_mod = 4;  // 3:right+constant 4:left+constant (when tx_msb_right = 1)
-        I2S0.conf_single_data = 0;
+        I2S0.conf_chan.tx_chan_mod = 4;  // 3:right+constant 4:left+constant (when tx_msb_right = 1)
+        I2S0.conf_single_data      = 0;
     }
 
-    // -> i2s_init_dma_intr
-    /* Set GDMA trigger module */
-    gdma_trigger_t trig = {};
-    trig.periph         = GDMA_TRIG_PERIPH_I2S;
-    trig.instance_id    = SOC_GDMA_TRIG_PERIPH_I2S0;
+    I2S0.conf1.tx_stop_en = 1;  // BCK and WCK are suppressed while FIFO is empty
 
-    /* Set GDMA config */
-    gdma_channel_alloc_config_t dma_cfg = {};
-    dma_cfg.direction                   = GDMA_CHANNEL_DIRECTION_TX;
-    /* Register a new GDMA tx channel */
-    gdma_new_channel(&dma_cfg, &i2s_out_isr_handle);
-    gdma_connect(i2s_out_isr_handle, trig);
-    gdma_tx_event_callbacks_t cb = {};
-    cb.on_trans_eof              = i2s_out_intr_handler;  // TODO FIXME!
+    // Connect DMA to FIFO
+    I2S0.fifo_conf.dscr_en = 1;  // Set this bit to enable I2S DMA mode. (R/W)
 
-    /* Set callback function for GDMA, the interrupt is triggered by GDMA, then the GDMA ISR will call the  callback function */
-    gdma_register_tx_event_callbacks(i2s_out_isr_handle, &cb, &o_dma);
+    I2S0.int_clr.val    = 0xFFFFFFFF;
+    I2S0.out_link.start = 1;
 
-    // i2s_ll_tx_stop_on_fifo_empty
-    I2S0.tx_conf.tx_stop_en = 1;  // BCK and WCK are suppressed while FIFO is empty
-
-    // Connect DMA to FIFO -> already done in GDMA
-    // i2s_ll_enable_dma
-    // I2S0.fifo_conf.dscr_en = 1;  // Set this bit to enable I2S DMA mode. (R/W)
-
-    // i2s_common -> i2s_tx_channel_start:
-
-    //     i2s_hal_tx_reset(&(handle->controller->hal));
-    I2S0.tx_conf.tx_reset = 1;
-    I2S0.tx_conf.tx_reset = 0;
-
-    gdma_reset(i2s_out_isr_handle);
-    //     i2s_ll_tx_reset_fifo(&(handle->controller->hal));
-    I2S0.tx_conf.tx_fifo_reset = 1;
-    I2S0.tx_conf.tx_fifo_reset = 0;
-
-    //     gdma_start((handle->dma.dma_chan), (uint32_t) handle->dma.desc[0]);
-    gdma_start(i2s_out_isr_handle, (uint32_t)o_dma.desc[0]);
-    // #else
-    //     esp_intr_enable(handle->dma.dma_chan);
-    //     i2s_hal_tx_enable_intr(&(handle->controller->hal));
-    //     i2s_hal_tx_enable_dma(&(handle->controller->hal));
-    //     i2s_hal_tx_start_link(&(handle->controller->hal), (uint32_t) handle->dma.desc[0]);
-    // #endif
-    //     i2s_hal_tx_start(&(handle->controller->hal));
-    I2S0.tx_conf.tx_update = 0;
-    I2S0.tx_conf.tx_update = 1;
-
-    // i2s_ll_clear_intr_status
-    // i2s_ll_start_out_link
-    // i2s_ll_tx_start
-    I2S0.int_clr.val = 0xFFFFFFFF;
-    // I2S0.out_link.start = 1;
-    I2S0.tx_conf.tx_start = 1;
-
+    I2S0.conf.tx_start = 1;
     // Wait for the first FIFO data to prevent the unintentional generation of 0 data
     ets_delay_us(20);
-    // i2s_ll_tx_stop_on_fifo_empty
-    I2S0.tx_conf.tx_stop_en = 0;  // BCK and WCK are generated regardless of the FIFO status
+    I2S0.conf1.tx_stop_en = 0;  // BCK and WCK are generated regardless of the FIFO status
 
     I2S_OUT_EXIT_CRITICAL();
 
@@ -623,6 +414,63 @@ static int i2s_fillout_dma_buffer(lldesc_t* dma_desc) {
     }
 
     return 0;
+}
+
+//
+// I2S out DMA Interrupts handler
+//
+static void IRAM_ATTR i2s_out_intr_handler(void* arg) {
+    lldesc_t*     finish_desc;
+    portBASE_TYPE high_priority_task_awoken = pdFALSE;
+
+    if (I2S0.int_st.out_eof || I2S0.int_st.out_total_eof) {
+        if (I2S0.int_st.out_total_eof) {
+            // This is tail of the DMA descriptors
+            I2S_OUT_ENTER_CRITICAL_ISR();
+            // Stop FIFO DMA
+            I2S0.out_link.stop = 1;
+            // Disconnect DMA from FIFO
+            I2S0.fifo_conf.dscr_en = 0;  //Unset this bit to disable I2S DMA mode. (R/W)
+            // Stop TX module
+            I2S0.conf.tx_start = 0;
+            I2S_OUT_EXIT_CRITICAL_ISR();
+        }
+        // Get the descriptor of the last item in the linkedlist
+        finish_desc = (lldesc_t*)I2S0.out_eof_des_addr;
+
+        // If the queue is full it's because we have an underflow,
+        // more than buf_count isr without new data, remove the front buffer
+        if (xQueueIsQueueFullFromISR(o_dma.queue)) {
+            lldesc_t* front_desc;
+            // Remove a descriptor from the DMA complete event queue
+            xQueueReceiveFromISR(o_dma.queue, &front_desc, &high_priority_task_awoken);
+            I2S_OUT_PULSER_ENTER_CRITICAL_ISR();
+            uint32_t port_data = 0;
+            if (i2s_out_pulser_status == STEPPING) {
+                port_data = ATOMIC_LOAD(&i2s_out_port_data);
+            }
+            I2S_OUT_PULSER_EXIT_CRITICAL_ISR();
+#    ifdef CONFIG_IDF_TARGET_ESP32
+            // lldesc_t.buf is const for S2.  Perhaps we can get by
+            // without replacing the data in the buffer since we are
+            // already in an error situation.
+            for (int i = 0; i < DMA_SAMPLE_COUNT; i++) {
+                front_desc->buf[i] = port_data;
+            }
+#    endif
+            front_desc->length = I2S_OUT_DMABUF_LEN;
+        }
+
+        // Send a DMA complete event to the I2S bitstreamer task with finished buffer
+        xQueueSendFromISR(o_dma.queue, &finish_desc, &high_priority_task_awoken);
+    }
+
+    if (high_priority_task_awoken == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
+
+    // clear interrupt
+    I2S0.int_clr.val = I2S0.int_st.val;  //clear pending interrupt
 }
 
 //
@@ -896,30 +744,12 @@ int i2s_out_init(i2s_out_init_t& init_param) {
     o_dma.queue   = xQueueCreate(I2S_OUT_DMABUF_COUNT, sizeof(uint32_t*));
 
     // Set the first DMA descriptor
-    // Configure TX DMA descriptor address and start TX DMA
-    // i2s_legacy -> i2s_tx_start()
-    // tx->desc[0] is apparently o_dma.desc[0].
-    gdma_start(i2s_out_isr_handle, (uint32_t)o_dma.desc[0] /*I2S0.tx->desc[0] */);
-    // #else
-    //         i2s_ll_tx_enable_dma(&(p_i2s[i2s_num]->hal));
-    //         i2s_ll_tx_enable_intr(&(p_i2s[i2s_num]->hal));
-    //         i2s_ll_tx_start_link(&(p_i2s[i2s_num]->hal), (uint32_t)p_i2s[i2s_num]->tx->desc[0]);
-    // #endif
-
-    // i2s_ll_tx_start(&(p_i2s[i2s_num]->hal));
-    I2S0.tx_conf.tx_update = 0;
-    I2S0.tx_conf.tx_update = 1;
-    I2S0.tx_conf.tx_start  = 0;
-
-    // I2S0.out_link.addr = (uint32_t)o_dma.desc[0];
+    I2S0.out_link.addr = (uint32_t)o_dma.desc[0];
 
     // stop i2s
-    // i2s_ll_tx_stop_link
-    //I2S0.out_link.stop = 1;
-    // i2s_ll_tx_stop
-    // I2S0.conf.tx_start = 0;
+    I2S0.out_link.stop = 1;
+    I2S0.conf.tx_start = 0;
 
-    // i2s_ll_clear_intr_status
     I2S0.int_clr.val = I2S0.int_st.val;  //clear pending interrupt
 
     //
@@ -929,115 +759,102 @@ int i2s_out_init(i2s_out_init_t& init_param) {
     // configure I2S data port interface.
 
     //reset i2s
+    I2S0.conf.tx_reset = 1;
+    I2S0.conf.tx_reset = 0;
+    I2S0.conf.rx_reset = 1;
+    I2S0.conf.rx_reset = 0;
 
-    // TODO?:
-    //     p_i2s[i2s_num]->tx->curr_ptr = NULL;
-    //     p_i2s[i2s_num]->tx->rw_pos   = 0;
+    //reset dma
+    I2S0.lc_conf.in_rst  = 1;  // Set this bit to reset in DMA FSM. (R/W)
+    I2S0.lc_conf.in_rst  = 0;
+    I2S0.lc_conf.out_rst = 1;  // Set this bit to reset out DMA FSM. (R/W)
+    I2S0.lc_conf.out_rst = 0;
 
-    //     i2s_hal_tx_reset(&(p_i2s[i2s_num]->hal));
-    I2S0.tx_conf.tx_reset = 1;
-    I2S0.tx_conf.tx_reset = 0;
-    I2S0.rx_conf.rx_reset = 1;
-    I2S0.rx_conf.rx_reset = 0;
+    // A lot of the stuff below could probably be replaced by i2s_set_clk();
 
-    gdma_reset(i2s_out_isr_handle);
-    // i2s_hal_tx_reset_fifo(&(p_i2s[i2s_num]->hal));
     i2s_out_reset_fifo_without_lock();
 
     //Enable and configure DMA
+    I2S0.lc_conf.check_owner        = 0;
+    I2S0.lc_conf.out_loop_test      = 0;
+    I2S0.lc_conf.out_auto_wrback    = 0;  // Disable auto outlink-writeback when all the data has been transmitted
+    I2S0.lc_conf.out_data_burst_en  = 0;
+    I2S0.lc_conf.outdscr_burst_en   = 0;
+    I2S0.lc_conf.out_no_restart_clr = 0;
+    I2S0.lc_conf.indscr_burst_en    = 0;
+    I2S0.lc_conf.out_eof_mode       = 1;  // I2S_OUT_EOF_INT generated when DMA has popped all data from the FIFO;
+    I2S0.conf2.lcd_en               = 0;
+    I2S0.conf2.camera_en            = 0;
+#    ifdef SOC_I2S_SUPPORTS_PDM_TX
+    // i2s_ll_tx_enable_pdm(dev, false);
+    // i2s_ll_tx_enable_pdm(dev2, false);
+    I2S0.pdm_conf.pcm2pdm_conv_en = 0;
+    I2S0.pdm_conf.pdm2pcm_conv_en = 0;
+#    endif
 
-    // ESP_RETURN_ON_ERROR(i2s_dma_intr_init(i2s_num, intr_alloc_flag), TAG, "I2S interrupt initailze failed");
-    // ->
-    /* Set GDMA trigger module */
-    gdma_trigger_t trig = {};
-    trig.periph         = GDMA_TRIG_PERIPH_I2S;
-    trig.instance_id    = SOC_GDMA_TRIG_PERIPH_I2S0;
-
-    /* Set GDMA config */
-    gdma_channel_alloc_config_t dma_cfg = {};
-    dma_cfg.direction                   = GDMA_CHANNEL_DIRECTION_TX;
-    /* Register a new GDMA tx channel */
-    gdma_new_channel(&dma_cfg, &i2s_out_isr_handle);
-    gdma_connect(i2s_out_isr_handle, trig);
-    gdma_tx_event_callbacks_t cb = {};
-    cb.on_trans_eof              = i2s_out_intr_handler;
-    /* Set callback function for GDMA, the interrupt is triggered by GDMA, then the GDMA ISR will call the  callback function */
-    gdma_register_tx_event_callbacks(i2s_out_isr_handle, &cb, &o_dma);
-
-    // I2S0.lc_conf.check_owner        = 0;
-    // I2S0.lc_conf.out_loop_test      = 0;
-    // I2S0.lc_conf.out_auto_wrback    = 0;  // Disable auto outlink-writeback when all the data has been transmitted
-    // I2S0.lc_conf.out_data_burst_en  = 0;
-    // I2S0.lc_conf.outdscr_burst_en   = 0;
-    // I2S0.lc_conf.out_no_restart_clr = 0;
-    // I2S0.lc_conf.indscr_burst_en    = 0;
-    // I2S0.lc_conf.out_eof_mode       = 1;  // I2S_OUT_EOF_INT generated when DMA has popped all data from the FIFO;
-    // I2S0.conf2.lcd_en             = 0;
-    // I2S0.conf2.camera_en          = 0;
-
-    // i2s_pcm_config
-    I2S0.tx_conf.tx_tdm_en     = 0;
-    I2S0.tx_conf.tx_pcm_bypass = 1;
-    I2S0.tx_conf.tx_pcm_conf   = 0;
-    I2S0.tx_conf.tx_pdm_en     = 0;
-
-    // I2S0.fifo_conf.dscr_en = 0;
+    I2S0.fifo_conf.dscr_en = 0;
 
     if (i2s_out_pulser_status == STEPPING) {
         // Channel output mode
-        I2S0.tx_conf.tx_chan_mod = 4;  // 3:right+constant 4:left+constant (when tx_msb_right = 1)
-        I2S0.conf_single_data    = 0;
+        I2S0.conf_chan.tx_chan_mod = 4;  // 3:right+constant 4:left+constant (when tx_msb_right = 1)
+        I2S0.conf_single_data      = 0;
     } else {
         // Static output mode
-        I2S0.tx_conf.tx_chan_mod = 3;  // 3:right+constant 4:left+constant (when tx_msb_right = 1)
-        I2S0.conf_single_data    = init_param.init_val;
+        I2S0.conf_chan.tx_chan_mod = 3;  // 3:right+constant 4:left+constant (when tx_msb_right = 1)
+        I2S0.conf_single_data      = init_param.init_val;
     }
 
 #    if I2S_OUT_NUM_BITS == 16
-    I2S0.fifo_conf.tx_fifo_mod = 0;   // 0: 16-bit dual channel data, 3: 32-bit single channel data
-    I2S0.fifo_conf.rx_fifo_mod = 0;   // 0: 16-bit dual channel data, 3: 32-bit single channel data
-    I2S0.tx_conf1.tx_bits_mod  = 16;  // default is 16-bits
-    I2S0.rx_conf1.rx_bits_mod  = 16;  // default is 16-bits
+    I2S0.fifo_conf.tx_fifo_mod        = 0;   // 0: 16-bit dual channel data, 3: 32-bit single channel data
+    I2S0.fifo_conf.rx_fifo_mod        = 0;   // 0: 16-bit dual channel data, 3: 32-bit single channel data
+    I2S0.sample_rate_conf.tx_bits_mod = 16;  // default is 16-bits
+    I2S0.sample_rate_conf.rx_bits_mod = 16;  // default is 16-bits
 #    else
-    // From: i2s_ll.h:397 (s3) vs i2s_ll.h:
-    // Data width is 32-bit:
-    I2S0.tx_conf1.tx_bits_mod      = 32 - 1;
-    I2S0.tx_conf1.tx_tdm_chan_bits = 32 - 1;
-    I2S0.rx_conf1.rx_bits_mod      = 32 - 1;
-    I2S0.rx_conf1.rx_tdm_chan_bits = 32 - 1;
+    I2S0.fifo_conf.tx_fifo_mod = 3;  // 0: 16-bit dual channel data, 3: 32-bit single channel data
+    I2S0.fifo_conf.rx_fifo_mod = 3;  // 0: 16-bit dual channel data, 3: 32-bit single channel data
+    // Data width is 32-bit. Forgetting this setting will result in a 16-bit transfer.
+    I2S0.sample_rate_conf.tx_bits_mod = 32;
+    I2S0.sample_rate_conf.rx_bits_mod = 32;
+#    endif
+    I2S0.conf.tx_mono                 = 0;   // Set this bit to enable transmitter’s mono mode in PCM standard mode.
+
+    I2S0.conf_chan.rx_chan_mod = 1;  // 1: right+right
+    I2S0.conf.rx_mono          = 0;
+
+    I2S0.fifo_conf.dscr_en = 1;  //connect DMA to fifo
+    I2S0.conf.tx_start     = 0;
+    I2S0.conf.rx_start     = 0;
+
+    I2S0.conf.tx_msb_right   = 1;  // Set this bit to place right-channel data at the MSB in the transmit FIFO.
+    I2S0.conf.tx_right_first = 0;  // Setting this bit allows the right-channel data to be sent first.
+
+    I2S0.conf.tx_slave_mod              = 0;  // Master
+    I2S0.fifo_conf.tx_fifo_mod_force_en = 1;  //The bit should always be set to 1.
+#    ifdef SOC_I2S_SUPPORTS_PDM_RX
+    //i2s_ll_rx_enable_pdm(dev, false);
+    I2S0.pdm_conf.rx_pdm_en = 0;  // Set this bit to enable receiver’s PDM mode.
+#    endif
+#    ifdef SOC_I2S_SUPPORTS_PDM_TX
+    //i2s_ll_tx_enable_pdm(dev, false);
+    I2S0.pdm_conf.tx_pdm_en = 0;  // Set this bit to enable transmitter’s PDM mode.
 #    endif
 
-    I2S0.tx_conf.tx_mono = 0;  // Set this bit to enable transmitter’s mono mode in PCM standard mode.
-
-    // I2S0.rx_conf.rx_chan_mod = 1;  // 1: right+right
-    I2S0.rx_conf.rx_mono = 0;
-
-    // I2S0.fifo_conf.dscr_en = 1;  //connect DMA to fifo
-    I2S0.tx_conf.tx_start = 0;
-    I2S0.rx_conf.rx_start = 0;
-
-    I2S0.tx_conf.tx_bit_order = 1;  // Set this bit to place right-channel data at the MSB in the transmit FIFO.
-    // I2S0.tx_conf.tx_right_first = 0;  // Setting this bit allows the right-channel data to be sent first.
-
-    I2S0.tx_conf.tx_slave_mod = 0;  // Master
-    // I2S0.fifo_conf.tx_fifo_mod_force_en = 1;  //The bit should always be set to 1.
-    I2S0.rx_conf.rx_pdm_en = 0;  // Set this bit to enable receiver’s PDM mode.
-    I2S0.tx_conf.tx_pdm_en = 0;  // Set this bit to enable transmitter’s PDM mode.
-
-    // I2S_COMM_FORMAT_I2S_LSB TODO FIXME?
-    // I2S0.tx_conf1.tx_short_sync = 0;  // Set this bit to enable transmitter in PCM standard mode.
-    // I2S0.tx_conf1.rx_short_sync = 0;  // Set this bit to enable receiver in PCM standard mode.
-    I2S0.tx_conf1.tx_msb_shift = 0;  // Do not use the Philips standard to avoid bit-shifting
-    I2S0.rx_conf1.rx_msb_shift = 0;  // Do not use the Philips standard to avoid bit-shifting
+    // I2S_COMM_FORMAT_I2S_LSB
+    I2S0.conf.tx_short_sync = 0;  // Set this bit to enable transmitter in PCM standard mode.
+    I2S0.conf.rx_short_sync = 0;  // Set this bit to enable receiver in PCM standard mode.
+    I2S0.conf.tx_msb_shift  = 0;  // Do not use the Philips standard to avoid bit-shifting
+    I2S0.conf.rx_msb_shift  = 0;  // Do not use the Philips standard to avoid bit-shifting
 
     //
     // i2s_set_clk
     //
 
     // set clock (fi2s) 160MHz / 5
-    // I2S0.clkm_conf.clka_en = 0;  // Use 160 MHz PLL_D2_CLK as reference
-    I2S0.tx_clkm_conf.tx_clk_sel = 2;  // CLK160
-                                       // N + b/a = 0
+#    ifdef CONFIG_IDF_TARGET_ESP32
+    // i2s_ll_rx_clk_set_src(dev, I2S_CLK_D2CLK);
+    I2S0.clkm_conf.clka_en = 0;  // Use 160 MHz PLL_D2_CLK as reference
+#    endif
+        // N + b/a = 0
 #    if I2S_OUT_NUM_BITS == 16
     // N = 10
     I2S0.clkm_conf.clkm_div_num = 10;  // minimum value of 2, reset value of 4, max 256 (I²S clock divider’s integral value)
@@ -1045,34 +862,22 @@ int i2s_out_init(i2s_out_init_t& init_param) {
     // N = 5
     // 5 could be changed to 2 to make I2SO pulse at 312.5 kHZ instead of 125 kHz, but doing so would
     // require some changes to deal with pulse lengths that are not an integral number of microseconds.
-    I2S0.tx_clkm_conf.tx_clkm_div_num = 5;  // minimum value of 2, reset value of 4, max 256 (I²S clock divider’s integral value)
+    I2S0.clkm_conf.clkm_div_num = 5;  // minimum value of 2, reset value of 4, max 256 (I²S clock divider’s integral value)
 #    endif
     // b/a = 0
-    // TODO FIXME!
-
-    // I2S0.tx_clkm_conf.clkm_div_b = 0;  // 0 at reset
-    // I2S0.tx_clkm_conf.clkm_div_a = 0;  // 0 at reset, what about divide by 0? (not an issue)
-    // TODO FIXME: is this correct?
-    I2S0.tx_clkm_div_conf.tx_clkm_div_x = 0;
-    I2S0.tx_clkm_div_conf.tx_clkm_div_y = 0;
-    I2S0.tx_clkm_div_conf.tx_clkm_div_z = 0;
+    I2S0.clkm_conf.clkm_div_b = 0;  // 0 at reset
+    I2S0.clkm_conf.clkm_div_a = 0;  // 0 at reset, what about divide by 0? (not an issue)
 
     // Bit clock configuration bit in transmitter mode.
     // fbck = fi2s / tx_bck_div_num = (160 MHz / 5) / 2 = 16 MHz
-    I2S0.tx_conf1.tx_bck_div_num = 2;  // minimum value of 2 defaults to 6
-    I2S0.rx_conf1.rx_bck_div_num = 2;
+    I2S0.sample_rate_conf.tx_bck_div_num = 2;  // minimum value of 2 defaults to 6
+    I2S0.sample_rate_conf.rx_bck_div_num = 2;
 
     // Enable TX interrupts (DMA Interrupts)
-
-    I2S0.tx_conf.tx_start = 0;
-    gdma_stop(i2s_out_isr_handle);
-
-    // i2s_ll_tx_disable_intr
-    // I2S0.int_ena.out_eof      = 1;  // Triggered when rxlink has finished sending a packet.
-    // I2S0.int_ena.out_dscr_err = 0;  // Triggered when invalid rxlink descriptors are encountered.
-    //
-    // I2S0.int_ena.out_total_eof = 1;  // Triggered when all transmitting linked lists are used up.
-    // I2S0.int_ena.out_done      = 0;  // Triggered when all transmitted and buffered data have been read.
+    I2S0.int_ena.out_eof       = 1;  // Triggered when rxlink has finished sending a packet.
+    I2S0.int_ena.out_dscr_err  = 0;  // Triggered when invalid rxlink descriptors are encountered.
+    I2S0.int_ena.out_total_eof = 1;  // Triggered when all transmitting linked lists are used up.
+    I2S0.int_ena.out_done      = 0;  // Triggered when all transmitted and buffered data have been read.
 
     // default pulse callback period (μsec)
     i2s_out_pulse_period = init_param.pulse_period;
@@ -1088,12 +893,8 @@ int i2s_out_init(i2s_out_init_t& init_param) {
     );
 
     // Allocate and Enable the I2S interrupt
-    //
-    // https://github.com/espressif/esp-idf/blob/6cfa88ed49b7d1209732347dae55578f4a679c98/components/driver/i2s/i2s_common.c
-    // line 660 and on.
-    //
-    // esp_intr_alloc(ETS_I2S0_INTR_SOURCE, 0, i2s_out_intr_handler, nullptr, &i2s_out_isr_handle);
-    // esp_intr_enable(i2s_out_isr_handle);
+    esp_intr_alloc(ETS_I2S0_INTR_SOURCE, 0, i2s_out_intr_handler, nullptr, &i2s_out_isr_handle);
+    esp_intr_enable(i2s_out_isr_handle);
 
     // Remember GPIO pin numbers
     i2s_out_ws_pin      = init_param.ws_pin;

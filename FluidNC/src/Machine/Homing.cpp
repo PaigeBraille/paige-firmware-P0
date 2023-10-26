@@ -1,6 +1,3 @@
-// Copyright (c) 2021 - Stefan de Bruijn, Mitch Bradley
-// Use of this source code is governed by a GPLv3 license that can be found in the LICENSE file.
-
 #include "Homing.h"
 
 #include "../MotionControl.h"  // mc_reset
@@ -312,7 +309,7 @@ namespace Machine {
     void Homing::done() {
         log_debug("Homing done");
 
-        if (sys.abort()) {
+        if (sys.abort) {
             return;  // Did not complete. Alarm state set by mc_alarm.
         }
         // Homing cycle complete! Setup system for normal operation.
@@ -323,15 +320,15 @@ namespace Machine {
 
         config->_stepping->endLowLatency();
 
-        if (!sys.abort()) {              // Execute startup scripts after successful homing.
-            sys.set_state(State::Idle);  // Set to IDLE when complete.
-            Stepper::go_idle();          // Set steppers to the settings idle state before returning.
+        if (!sys.abort) {             // Execute startup scripts after successful homing.
+            sys.state = State::Idle;  // Set to IDLE when complete.
+            Stepper::go_idle();       // Set steppers to the settings idle state before returning.
         }
     }
 
     void Homing::nextCycle() {
         // Start the next cycle in the queue
-        if (sys.state() == State::Alarm) {
+        if (sys.state == State::Alarm) {
             while (!_remainingCycles.empty()) {
                 _remainingCycles.pop();
             }
@@ -426,7 +423,7 @@ namespace Machine {
     // the homing state machine through its phases.
     void Homing::run_cycles(AxisMask axisMask) {
         if (!config->_kinematics->canHome(axisMask)) {
-            sys.set_state(State::Alarm);
+            sys.state = State::Alarm;
             return;
         }
 
@@ -468,12 +465,12 @@ namespace Machine {
 
         if (_remainingCycles.empty()) {
             log_error("No homing cycles defined");
-            sys.set_state(State::Alarm);
+            sys.state = State::Alarm;
             return;
         }
         config->_stepping->beginLowLatency();
 
-        sys.set_state(State::Homing);
+        sys.state = State::Homing;
         nextCycle();
     }
 

@@ -10,7 +10,7 @@
 #include "../Configuration/Configurable.h"
 #include "../Configuration/GenericFactory.h"
 
-#include "../GCode.h"  // MaxToolNumber
+#include "src/GCode.h"  // MaxToolNumber
 
 // ===============  No floats! ===========================
 // ================ NO FLOATS! ==========================

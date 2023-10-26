@@ -7,12 +7,13 @@
 #include <esp_attr.h>  // IRAM_ATTR
 
 namespace Pins {
-    void PinDetail::attachInterrupt(void (*callback)(void*, bool), void* arg, int mode) {
+    void PinDetail::attachInterrupt(void (*callback)(void*), void* arg, int mode) {
         Assert(false, "Interrupts are not supported by pin %d", _index);
     }
-
-    void PinDetail::detachInterrupt() { Assert(false, "Interrupts are not supported by pin %d", _index); }
-
+    void PinDetail::detachInterrupt() {
+        Assert(false, "Interrupts are not supported by pin %d", _index);
+        ;
+    }
     void IRAM_ATTR PinDetail::synchronousWrite(int high) { write(high); }
 
 }

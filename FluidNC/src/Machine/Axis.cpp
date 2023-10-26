@@ -51,7 +51,7 @@ namespace Machine {
         }
 
         if (!_motors[0] && _motors[1]) {
-            sys.set_state(State::ConfigAlarm);
+            sys.state = State::ConfigAlarm;
             log_error("motor1 defined without motor0");
         }
 
