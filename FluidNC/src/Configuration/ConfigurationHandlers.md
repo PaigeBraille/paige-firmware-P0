@@ -40,7 +40,7 @@ public:
     Pin _data;
     Pin _ws;
 
-    void validate() const override {
+    void validate() override {
         if (!_bck.undefined() || !_data.undefined() || !_ws.undefined()) {
             Assert(!_bck.undefined(), "I2SO BCK pin should be configured once.");
             Assert(!_data.undefined(), "I2SO Data pin should be configured once.");
@@ -123,4 +123,4 @@ At this point, this is simply not implemented.
 
 The generator basically traverses the complete tree, and generates a 
 yaml file. The main point of this is to create a `config.yaml` file 
-in SPIFFS, which holds the main startup configuration. 
+in LocalFS, which holds the main startup configuration.

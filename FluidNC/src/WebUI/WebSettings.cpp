@@ -12,34 +12,32 @@
 
 #include "../Settings.h"
 #include "../Machine/MachineConfig.h"
-#include "../Machine/WifiSTAConfig.h"
 #include "../Configuration/JsonGenerator.h"
-#include "../Uart.h"   // Uart0.baud
-#include "Commands.h"  // COMMANDS::wait(1);
+#include "../Uart.h"       // Uart0.baud
+#include "../Report.h"     // git_info
+#include "../InputFile.h"  // InputFile
+
+#include "Driver/localfs.h"  // localfs_format
+
+#include "Commands.h"  // COMMANDS::restart_MCU();
 #include "WifiConfig.h"
-#include "WebClient.h"
-#include "WebServer.h"
-#include "NotificationsService.h"  // notificationsservice
-#include "TelnetServer.h"          // telnet_server
+
+#include "../HashFS.h"
 
 #include <cstring>
-
-#ifdef ENABLE_WIFI
-#    include <WiFi.h>
-#    include <esp_wifi.h>
-#    include <esp_ota_ops.h>
-#endif
-
-#include <FS.h>
-#include <SPIFFS.h>
-#include <SD.h>
+#include <sstream>
+#include <iomanip>
 
 namespace WebUI {
 
-    enum_opt_t onoffOptions = { { "OFF", 0 }, { "ON", 1 } };
+    static std::string LeftJustify(const char* s, size_t width) {
+        std::string ret(s);
 
-    Print* webresponse = nullptr;
-    bool   isWeb       = false;
+        for (size_t l = ret.length(); width > l; width--) {
+            ret += ' ';
+        }
+        return ret;
+    }
 
     typedef struct {
         char* key;
@@ -98,7 +96,7 @@ namespace WebUI {
     }
 }
 
-Error WebCommand::action(char* value, WebUI::AuthenticationLevel auth_level, Print& out) {
+Error WebCommand::action(char* value, WebUI::AuthenticationLevel auth_level, Channel& out) {
     if (_cmdChecker && _cmdChecker()) {
         return Error::AnotherInterfaceBusy;
     }
@@ -106,759 +104,456 @@ Error WebCommand::action(char* value, WebUI::AuthenticationLevel auth_level, Pri
     if (!value) {
         value = &empty;
     }
-    WebUI::webresponse = &out;
-    return _action(value, auth_level);
+    return _action(value, auth_level, out);
 };
 
 namespace WebUI {
-    static int webColumn = 0;
-    // We create a variety of print functions to make the rest
-    // of the code more compact and readable.
-    static void webPrint(const char* s) {
-        *webresponse << s;
-        webColumn += strlen(s);
-    }
-    static void webPrintSetColumn(int column) {
-        while (webColumn < column) {
-            webPrint(" ");
-        }
-    }
-    static void webPrint(String s) { webPrint(s.c_str()); }
-    static void webPrint(const char* s1, const char* s2) {
-        webPrint(s1);
-        webPrint(s2);
-    }
-    static void webPrint(const char* s1, String s2) {
-        webPrint(s1);
-        webPrint(s2.c_str());
-    }
-    static void webPrint(const char* s1, const char* s2, const char* s3) {
-        webPrint(s1);
-        webPrint(s2);
-        webPrint(s3);
-    }
-    static void webPrint(const char* s, IPAddress ip) {
-        webPrint(s);
-        webPrint(ip.toString().c_str());
-    }
-    static void webPrintln(const char* s) {
-        webPrint(s);
-        webPrint("\n");
-        webColumn = 0;
-    }
-    static void webPrintln(String s) { webPrintln(s.c_str()); }
-    static void webPrintln(const char* s1, const char* s2) {
-        webPrint(s1);
-        webPrintln(s2);
-    }
-    static void webPrintln(const char* s, IPAddress ip) {
-        webPrint(s);
-        webPrintln(ip.toString().c_str());
-    }
-    static void webPrintln(const char* s, String s2) { webPrintln(s, s2.c_str()); }
-
-    static void print_mac(const char* s, String mac) {
-        webPrint(s);
-        webPrint(" (");
-        webPrint(mac);
-        webPrintln(")");
-    }
-
-    static Error showFwInfo(char* parameter, AuthenticationLevel auth_level) {  // ESP800
-        webPrint("FW version: FluidNC ");
-        webPrint(GIT_TAG);
-        webPrint(GIT_REV);
+    // Used by js/connectdlg.js
+    static Error showFwInfo(char* parameter, AuthenticationLevel auth_level, Channel& out) {  // ESP800
+        LogStream s(out, "FW version: FluidNC ");
+        s << git_info;
         // TODO: change grbl-embedded to FluidNC after fixing WebUI
-        webPrint(" # FW target:grbl-embedded  # FW HW:");
-        webPrint(config->_sdCard->get_state() == SDCard::State::NotPresent ? "No SD" : "Direct SD");
-        webPrint("  # primary sd:/sd # secondary sd:none # authentication:");
+        s << " # FW target:grbl-embedded  # FW HW:";
+
+        // std::error_code ec;
+        // FluidPath { "/sd", ec };
+        // s << (ec ? "No SD" : "Direct SD");
+
+        // We do not check the SD presence here because if the SD card is out,
+        // WebUI will switch to M20 for SD access, which is wrong for FluidNC
+        s << "Direct SD";
+
+        s << "  # primary sd:/sd # secondary sd:none ";
+
+        s << " # authentication:";
 #ifdef ENABLE_AUTHENTICATION
-        webPrint("yes");
+        s << "yes";
 #else
-        webPrint("no");
+        s << "no";
 #endif
-#ifdef ENABLE_WIFI
-        webPrint(" # webcommunication: Sync: ", String(web_server.port() + 1));
-        webPrint(":");
-        switch (WiFi.getMode()) {
-            case WIFI_MODE_AP:
-                webPrint(WiFi.softAPIP().toString());
-                break;
-            case WIFI_MODE_STA:
-                webPrint(WiFi.localIP().toString());
-                break;
-            case WIFI_MODE_APSTA:
-                webPrint(WiFi.softAPIP().toString());
-                break;
-            default:
-                webPrint("0.0.0.0");
-                break;
-        }
-        webPrint(" # hostname:", wifi_config.Hostname());
-        if (WiFi.getMode() == WIFI_AP) {
-            webPrint("(AP mode)");
-        }
-#endif
+        s << wifi_config.webInfo();
+
         //to save time in decoding `?`
-        webPrintln(" # axis:", String(config->_axes->_numberAxis));
+        s << " # axis:" << config->_axes->_numberAxis;
         return Error::Ok;
     }
 
-    static Error SPIFFSSize(char* parameter, AuthenticationLevel auth_level) {  // ESP720
-        webPrint(parameter);
-        webPrint("SPIFFS  Total:", formatBytes(SPIFFS.totalBytes()));
-        webPrintln(" Used:", formatBytes(SPIFFS.usedBytes()));
+    static Error localFSSize(char* parameter, AuthenticationLevel auth_level, Channel& out) {  // ESP720
+        std::error_code ec;
+
+        auto space = stdfs::space(FluidPath { "", localfsName, ec }, ec);
+        if (ec) {
+            log_to(out, "Error ", ec.message());
+            return Error::FsFailedMount;
+        }
+        auto totalBytes = space.capacity;
+        auto freeBytes  = space.available;
+        auto usedBytes  = totalBytes - freeBytes;
+
+        log_to(out, parameter, "LocalFS  Total:" << formatBytes(localfs_size()) << " Used:" << formatBytes(usedBytes));
         return Error::Ok;
     }
 
-    static Error formatSpiffs(char* parameter, AuthenticationLevel auth_level) {  // ESP710
-        if (strcmp(parameter, "FORMAT") != 0) {
-            webPrintln("Parameter must be FORMAT");
-            return Error::InvalidValue;
+    static Error formatLocalFS(char* parameter, AuthenticationLevel auth_level, Channel& out) {  // ESP710
+        if (localfs_format(parameter)) {
+            return Error::FsFailedFormat;
         }
-        webPrint("Formatting");
-        SPIFFS.format();
-        webPrintln("...Done");
+        log_info("Local filesystem formatted to " << localfsName);
         return Error::Ok;
     }
-
-    static Error runLocalFile(char* parameter, AuthenticationLevel auth_level) {  // ESP700
-        if (sys.state != State::Idle) {
-            webPrintln("Busy");
-            return Error::IdleError;
-        }
-        String path = trim(parameter);
-        if ((path.length() > 0) && (path[0] != '/')) {
-            path = "/" + path;
-        }
-        if (!SPIFFS.exists(path)) {
-            webPrintln("Error: No such file!");
-            return Error::FsFileNotFound;
-        }
-        File currentfile = SPIFFS.open(path, FILE_READ);
-        if (!currentfile) {  //if file open success
-            return Error::FsFailedOpenFile;
-        }
-        //until no line in file
-        Error  err;
-        Error  accumErr = Error::Ok;
-        Print& out      = webresponse ? *webresponse : allClients;
-        while (currentfile.available()) {
-            String currentline = currentfile.readStringUntil('\n');
-            if (currentline.length() > 0) {
-                uint8_t line[256];
-                currentline.getBytes(line, 255);
-                err = execute_line((char*)line, out, auth_level);
-                if (err != Error::Ok) {
-                    accumErr = err;
-                }
-                COMMANDS::wait(1);
-            }
-        }
-        currentfile.close();
-        return accumErr;
-    }
-
-    static Error showLocalFile(char* parameter, AuthenticationLevel auth_level) {  // ESP701
-        if (sys.state != State::Idle && sys.state != State::Alarm) {
-            return Error::IdleError;
-        }
-        String path = trim(parameter);
-        if ((path.length() > 0) && (path[0] != '/')) {
-            path = "/" + path;
-        }
-        if (!SPIFFS.exists(path)) {
-            webPrintln("Error: No such file!");
-            return Error::FsFileNotFound;
-        }
-        File currentfile = SPIFFS.open(path, FILE_READ);
-        if (!currentfile) {
-            return Error::FsFailedOpenFile;
-        }
-        webPrint(dataBeginMarker);
-        while (currentfile.available()) {
-            // String currentline = currentfile.readStringUntil('\n');
-            //            if (currentline.length() > 0) {
-            //                webPrintln(currentline);
-            //            }
-            webPrintln(currentfile.readStringUntil('\n'));
-        }
-        currentfile.close();
-        webPrint(dataEndMarker);
-        return Error::Ok;
-    }
-
-#ifdef ENABLE_WIFI
-    enum_opt_t notificationOptions = {
-        { "NONE", 0 },
-        { "LINE", 3 },
-        { "PUSHOVER", 1 },
-        { "EMAIL", 2 },
-    };
-    EnumSetting*   notification_type;
-    StringSetting* notification_t1;
-    StringSetting* notification_t2;
-    StringSetting* notification_ts;
-
-    static Error showSetNotification(char* parameter, AuthenticationLevel auth_level) {  // ESP610
-        if (*parameter == '\0') {
-            webPrint("", notification_type->getStringValue());
-            webPrintln(" ", notification_ts->getStringValue());
-            return Error::Ok;
-        }
-        if (!split_params(parameter)) {
-            return Error::InvalidValue;
-        }
-        char* ts  = get_param("TS", false);
-        char* t2  = get_param("T2", false);
-        char* t1  = get_param("T1", false);
-        char* ty  = get_param("type", false);
-        Error err = notification_type->setStringValue(ty);
-        if (err == Error::Ok) {
-            err = notification_t1->setStringValue(t1);
-        }
-        if (err == Error::Ok) {
-            err = notification_t2->setStringValue(t2);
-        }
-        if (err == Error::Ok) {
-            err = notification_ts->setStringValue(ts);
-        }
-        return err;
-    }
-
-    static Error sendMessage(char* parameter, AuthenticationLevel auth_level) {  // ESP600
-        if (*parameter == '\0') {
-            webPrintln("Invalid message!");
-            return Error::InvalidValue;
-        }
-        if (!notificationsservice.sendMSG("GRBL Notification", parameter)) {
-            webPrintln("Cannot send message!");
-            return Error::MessageFailed;
-        }
-        return Error::Ok;
-    }
-#endif
 
 #ifdef ENABLE_AUTHENTICATION
-    static Error setUserPassword(char* parameter, AuthenticationLevel auth_level) {  // ESP555
+    static Error setUserPassword(char* parameter, AuthenticationLevel auth_level, Channel& out) {  // ESP555
         if (*parameter == '\0') {
             user_password->setDefault();
             return Error::Ok;
         }
         if (user_password->setStringValue(parameter) != Error::Ok) {
-            webPrintln("Invalid Password");
+            log_to(out, "Invalid Password");
             return Error::InvalidValue;
         }
         return Error::Ok;
     }
 #endif
 
-    static Error setSystemMode(char* parameter, AuthenticationLevel auth_level) {  // ESP444
+    static Error restart(char* parameter, AuthenticationLevel auth_level, Channel& out) {
+        log_info("Restarting");
+        COMMANDS::restart_MCU();
+        return Error::Ok;
+    }
+
+    // used by js/restartdlg.js
+    static Error setSystemMode(char* parameter, AuthenticationLevel auth_level, Channel& out) {  // ESP444
         parameter = trim(parameter);
         if (strcasecmp(parameter, "RESTART") != 0) {
-            webPrintln("Incorrect command");
+            log_to(out, "Parameter must be RESTART");
             return Error::InvalidValue;
         }
-        log_info("Restarting");
-        COMMANDS::restart_ESP();
-        return Error::Ok;
+        return restart(parameter, auth_level, out);
     }
 
-    static Error restart(char* parameter, AuthenticationLevel auth_level) {
-        parameter = trim(parameter);
-        log_info("Restarting");
-        COMMANDS::restart_ESP();
-        return Error::Ok;
-    }
+    // Used by js/statusdlg.js
+    static Error showSysStats(char* parameter, AuthenticationLevel auth_level, Channel& out) {  // ESP420
+        log_to(out, "Chip ID: ", (uint16_t)(ESP.getEfuseMac() >> 32));
+        log_to(out, "CPU Cores: ", ESP.getChipCores());
+        log_to(out, "CPU Frequency: ", ESP.getCpuFreqMHz() << "Mhz");
+        std::ostringstream msg;
+        msg << std::fixed << std::setprecision(1) << temperatureRead() << "°C";
+        log_to(out, "CPU Temperature: ", msg.str());
+        log_to(out, "Free memory: ", formatBytes(ESP.getFreeHeap()));
+        log_to(out, "SDK: ", ESP.getSdkVersion());
+        log_to(out, "Flash Size: ", formatBytes(ESP.getFlashChipSize()));
 
-    static void showWifiStats() {
-#ifdef ENABLE_WIFI
-        int mode = WiFi.getMode();
-        if (mode != WIFI_MODE_NULL) {
-            //Is OTA available ?
-            size_t flashsize = 0;
-            if (esp_ota_get_running_partition()) {
-                const esp_partition_t* partition = esp_ota_get_next_update_partition(NULL);
-                if (partition) {
-                    flashsize = partition->size;
-                }
-            }
-            webPrintln("Available Size for update: ", formatBytes(flashsize));
-            webPrintln("Available Size for SPIFFS: ", formatBytes(SPIFFS.totalBytes()));
-
-            webPrintln("Web port: ", String(web_server.port()));
-            webPrintln("Data port: ", String(telnet_server.port()));
-            webPrintln("Hostname: ", wifi_config.Hostname());
-        }
-
-        webPrint("Current WiFi Mode: ");
-        switch (mode) {
-            case WIFI_STA:
-                print_mac("STA", WiFi.macAddress());
-
-                webPrint("Connected to: ");
-                if (WiFi.isConnected()) {  //in theory no need but ...
-                    webPrintln(WiFi.SSID());
-                    webPrintln("Signal: ", String(wifi_config.getSignal(WiFi.RSSI())) + "%");
-
-                    uint8_t PhyMode;
-                    esp_wifi_get_protocol(WIFI_IF_STA, &PhyMode);
-                    const char* modeName;
-                    switch (PhyMode) {
-                        case WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N:
-                            modeName = "11n";
-                            break;
-                        case WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G:
-                            modeName = "11g";
-                            break;
-                        case WIFI_PROTOCOL_11B:
-                            modeName = "11b";
-                            break;
-                        default:
-                            modeName = "???";
-                    }
-                    webPrintln("Phy Mode: ", modeName);
-
-                    webPrintln("Channel: ", String(WiFi.channel()));
-
-                    tcpip_adapter_dhcp_status_t dhcp_status;
-                    tcpip_adapter_dhcpc_get_status(TCPIP_ADAPTER_IF_STA, &dhcp_status);
-                    webPrintln("IP Mode: ", dhcp_status == TCPIP_ADAPTER_DHCP_STARTED ? "DHCP" : "Static");
-                    webPrintln("IP: ", WiFi.localIP());
-                    webPrintln("Gateway: ", WiFi.gatewayIP());
-                    webPrintln("Mask: ", WiFi.subnetMask());
-                    webPrintln("DNS: ", WiFi.dnsIP());
-
-                }  //this is web command so connection => no command
-                webPrint("Disabled Mode: ");
-                print_mac("AP", WiFi.softAPmacAddress());
-                break;
-            case WIFI_AP:
-                print_mac("AP", WiFi.softAPmacAddress());
-
-                wifi_config_t conf;
-                esp_wifi_get_config(WIFI_IF_AP, &conf);
-                webPrintln("SSID: ", (const char*)conf.ap.ssid);
-                webPrintln("Visible: ", (conf.ap.ssid_hidden == 0) ? "Yes" : "No");
-
-                const char* mode;
-                switch (conf.ap.authmode) {
-                    case WIFI_AUTH_OPEN:
-                        mode = "None";
-                        break;
-                    case WIFI_AUTH_WEP:
-                        mode = "WEP";
-                        break;
-                    case WIFI_AUTH_WPA_PSK:
-                        mode = "WPA";
-                        break;
-                    case WIFI_AUTH_WPA2_PSK:
-                        mode = "WPA2";
-                        break;
-                    default:
-                        mode = "WPA/WPA2";
-                }
-
-                webPrintln("Authentication: ", mode);
-                webPrintln("Max Connections: ", String(conf.ap.max_connection));
-
-                tcpip_adapter_dhcp_status_t dhcp_status;
-                tcpip_adapter_dhcps_get_status(TCPIP_ADAPTER_IF_AP, &dhcp_status);
-                webPrintln("DHCP Server: ", dhcp_status == TCPIP_ADAPTER_DHCP_STARTED ? "Started" : "Stopped");
-
-                webPrintln("IP: ", WiFi.softAPIP());
-
-                tcpip_adapter_ip_info_t ip_AP;
-                tcpip_adapter_get_ip_info(TCPIP_ADAPTER_IF_AP, &ip_AP);
-                webPrintln("Gateway: ", IPAddress(ip_AP.gw.addr));
-                webPrintln("Mask: ", IPAddress(ip_AP.netmask.addr));
-
-                wifi_sta_list_t          station;
-                tcpip_adapter_sta_list_t tcpip_sta_list;
-                esp_wifi_ap_get_sta_list(&station);
-                tcpip_adapter_get_sta_list(&station, &tcpip_sta_list);
-                webPrintln("Connected clients: ", String(station.num));
-
-                for (int i = 0; i < station.num; i++) {
-                    webPrint(wifi_config.mac2str(tcpip_sta_list.sta[i].mac));
-                    webPrintln(" ", IPAddress(tcpip_sta_list.sta[i].ip.addr));
-                }
-                webPrint("Disabled Mode: ");
-                print_mac("STA", WiFi.macAddress());
-                break;
-            case WIFI_AP_STA:  //we should not be in this state but just in case ....
-                webPrintln("Mixed");
-
-                print_mac("STA", WiFi.macAddress());
-                print_mac("AP", WiFi.softAPmacAddress());
-                break;
-            default:  //we should not be there if no wifi ....
-                webPrintln("Off");
-                break;
-        }
-
-        webPrint("Notifications: ");
-        webPrint(notificationsservice.started() ? "Enabled" : "Disabled");
-        if (notificationsservice.started()) {
-            webPrint("(");
-            webPrint(notificationsservice.getTypeString());
-            webPrint(")");
-        }
-        webPrintln("");
-#endif
-    }
-
-    static Error showSysStats(char* parameter, AuthenticationLevel auth_level) {  // ESP420
-        webPrintln("Chip ID: ", String((uint16_t)(ESP.getEfuseMac() >> 32)));
-        webPrintln("CPU Frequency: ", String(ESP.getCpuFreqMHz()) + "Mhz");
-        webPrintln("CPU Temperature: ", String(temperatureRead(), 1) + "C");
-        webPrintln("Free memory: ", formatBytes(ESP.getFreeHeap()));
-        webPrintln("SDK: ", ESP.getSdkVersion());
-        webPrintln("Flash Size: ", formatBytes(ESP.getFlashChipSize()));
-
-#ifdef ENABLE_WIFI
         // Round baudRate to nearest 100 because ESP32 can say e.g. 115201
-        webPrintln("Baud rate: ", String((Uart0.baud / 100) * 100));
-        webPrintln("Sleep mode: ", WiFi.getSleep() ? "Modem" : "None");
-        showWifiStats();
-#endif
+        //        log_to(out, "Baud rate: ", ((Uart0.baud / 100) * 100));
 
-#ifdef ENABLE_BLUETOOTH
-        if (config->_comms->_bluetoothConfig) {
-            webPrintln(config->_comms->_bluetoothConfig->info().c_str());
+        WiFiConfig::showWifiStats(out);
+
+        std::string info = bt_config.info();
+        if (info.length()) {
+            log_to(out, info);
         }
-#endif
-        webPrint("FW version: FluidNC ");
-        webPrint(GIT_TAG);
-        webPrint(GIT_REV);
-        webPrintln("");
+        log_to(out, "FW version: FluidNC ", git_info);
         return Error::Ok;
     }
 
-#ifdef ENABLE_WIFI
-    StringSetting* wifi_sta_password;
-    StringSetting* wifi_ap_password;
-
-    static Error listAPs(char* parameter, AuthenticationLevel auth_level) {  // ESP410
-        JSONencoder j(false, webresponse);
-        j.begin();
-        j.begin_array("AP_LIST");
-        // An initial async scanNetworks was issued at startup, so there
-        // is a good chance that scan information is already available.
-        int n = WiFi.scanComplete();
-        switch (n) {
-            case -2:                      // Scan not triggered
-                WiFi.scanNetworks(true);  // Begin async scan
-                break;
-            case -1:  // Scan in progress
-                break;
-            default:
-                for (int i = 0; i < n; ++i) {
-                    j.begin_object();
-                    j.member("SSID", WiFi.SSID(i));
-                    j.member("SIGNAL", wifi_config.getSignal(WiFi.RSSI(i)));
-                    j.member("IS_PROTECTED", WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
-                    //            j->member("IS_PROTECTED", WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "0" : "1");
-                    j.end_object();
-                }
-                WiFi.scanDelete();
-                // Restart the scan in async mode so new data will be available
-                // when we ask again.
-                n = WiFi.scanComplete();
-                if (n == -2) {
-                    WiFi.scanNetworks(true);
-                }
-                break;
-        }
-        j.end_array();
-        j.end();
-        return Error::Ok;
-    }
-#endif
-
-    static Error setWebSetting(char* parameter, AuthenticationLevel auth_level) {  // ESP401
+    static Error setWebSetting(char* parameter, AuthenticationLevel auth_level, Channel& out) {  // ESP401
+        // The string is of the form "P=name T=type V=value
         // We do not need the "T=" (type) parameter because the
-        // Setting objects know their own type
-        if (!split_params(parameter)) {
+        // Setting objects know their own type.  We do not use
+        // split_params because if fails if the value string
+        // contains '='
+        if (strncmp(parameter, "P=", strlen("P="))) {
             return Error::InvalidValue;
         }
-        char*       sval = get_param("V", true);
-        const char* spos = get_param("P", false);
-        if (*spos == '\0') {
-            webPrintln("Missing parameter");
+        char* spos = &parameter[2];
+        char* scan;
+        for (scan = spos; *scan != ' ' && *scan != '\0'; ++scan) {}
+        if (*scan == '\0') {
             return Error::InvalidValue;
         }
-        Error ret = do_command_or_setting(spos, sval, auth_level, *webresponse);
+        // *scan is ' ' so we have found the end of the spos string
+        *scan++ = '\0';
+
+        if (strncmp(scan, "T=", strlen("T="))) {
+            return Error::InvalidValue;
+        }
+        // Find the end of the T=type string
+        for (scan += strlen("T="); *scan != ' ' && *scan != '\0'; ++scan) {}
+        if (strncmp(scan, " V=", strlen(" V="))) {
+            return Error::InvalidValue;
+        }
+        char* sval = scan + strlen(" V=");
+
+        Error ret = do_command_or_setting(spos, sval, auth_level, out);
         return ret;
     }
 
-    static Error listSettings(char* parameter, AuthenticationLevel auth_level) {  // ESP400
-        JSONencoder j(false, webresponse);
+    // Used by js/setting.js
+    static Error listSettings(char* parameter, AuthenticationLevel auth_level, Channel& out) {  // ESP400
+        JSONencoder j(true, &out);
         j.begin();
         j.begin_array("EEPROM");
 
+        // NVS settings
+        j.setCategory("nvs");
+        for (Setting* js = Setting::List; js; js = js->next()) {
+            js->addWebui(&j);
+        }
+
+        // Configuration tree
+        j.setCategory("tree");
         Configuration::JsonGenerator gen(j);
         config->group(gen);
+
         j.end_array();
         j.end();
 
         return Error::Ok;
     }
 
-    static Error openSDFile(char* parameter, Print& client, AuthenticationLevel auth_level) {
+    static Error openFile(const char* fs, char* parameter, AuthenticationLevel auth_level, Channel& out, InputFile*& theFile) {
         if (*parameter == '\0') {
-            webPrintln("Missing file name!");
+            log_to(out, "Missing file name!");
             return Error::InvalidValue;
         }
-        String path = trim(parameter);
+        std::string path(parameter);
         if (path[0] != '/') {
             path = "/" + path;
         }
-        switch (config->_sdCard->begin(SDCard::State::BusyReading)) {
-            case SDCard::State::Idle:
-                break;
-            case SDCard::State::NotPresent:
-                webPrintln("No SD Card");
-                return Error::FsFailedMount;
-            default:
-                webPrintln("SD Card Busy");
-                return Error::FsFailedBusy;
-        }
 
-        if (!config->_sdCard->openFile(SD, path.c_str(), client, auth_level)) {
-            report_status_message(Error::FsFailedRead, client);
-            webPrintln("");
-            return Error::FsFailedOpenFile;
-        }
+        try {
+            theFile = new InputFile(fs, path.c_str(), auth_level, out);
+        } catch (Error err) { return err; }
         return Error::Ok;
     }
 
-    static Error showSDFile(char* parameter, AuthenticationLevel auth_level) {  // ESP221
-        if (sys.state != State::Idle && sys.state != State::Alarm) {
+    static Error showFile(const char* fs, char* parameter, AuthenticationLevel auth_level, Channel& out) {  // ESP221
+        if (notIdleOrAlarm()) {
             return Error::IdleError;
         }
-        Error  err;
-        Print& client = (webresponse) ? *webresponse : allClients;
-        if ((err = openSDFile(parameter, client, auth_level)) != Error::Ok) {
+        InputFile* theFile;
+        Error      err;
+        if ((err = openFile(fs, parameter, auth_level, out, theFile)) != Error::Ok) {
             return err;
         }
-        webPrint(dataBeginMarker);
         char  fileLine[255];
         Error res;
-        while ((res = config->_sdCard->readFileLine(fileLine, 255)) == Error::Ok) {
-            webPrintln(fileLine);
+        while ((res = theFile->readLine(fileLine, 255)) == Error::Ok) {
+            // We cannot use the 2-argument form of log_to() here because
+            // fileLine can be overwritten by readLine before the output
+            // task has a chance to forward the line to the output channel.
+            // The 3-argument form works because it copies the line to a
+            // temporary string.
+            log_to(out, "", fileLine);
         }
         if (res != Error::Eof) {
-            webPrintln(errorString(res));
+            log_to(out, errorString(res));
         }
-        config->_sdCard->closeFile();
-        webPrint(dataEndMarker);
+        delete theFile;
         return Error::Ok;
     }
 
-    static Error runSDFile(char* parameter, AuthenticationLevel auth_level) {  // ESP220
+    static Error showSDFile(char* parameter, AuthenticationLevel auth_level, Channel& out) {  // ESP221
+        return showFile("sd", parameter, auth_level, out);
+    }
+    static Error showLocalFile(char* parameter, AuthenticationLevel auth_level, Channel& out) {  // ESP701
+        return showFile("", parameter, auth_level, out);
+    }
+
+    static Error runFile(const char* fs, char* parameter, AuthenticationLevel auth_level, Channel& out) {
         Error err;
-        if (sys.state == State::Alarm || sys.state == State::ConfigAlarm) {
-            webPrintln("Alarm");
+        if (sys.state() == State::Alarm || sys.state() == State::ConfigAlarm) {
+            log_to(out, "Alarm");
             return Error::IdleError;
         }
-        if (sys.state != State::Idle) {
-            webPrintln("Busy");
+        if (sys.state() != State::Idle) {
+            log_to(out, "Busy");
             return Error::IdleError;
         }
-        Print& client = (webresponse) ? *webresponse : allClients;
-        if ((err = openSDFile(parameter, client, auth_level)) != Error::Ok) {
+        InputFile* theFile;
+        if ((err = openFile(fs, parameter, auth_level, out, theFile)) != Error::Ok) {
             return err;
         }
-        auto sdCard = config->_sdCard;
+        allChannels.registration(theFile);
 
-        char  fileLine[255];
-        Error res = sdCard->readFileLine(fileLine, 255);
-        if (res != Error::Ok) {
-            report_status_message(res, client);
-            // report_status_message will close the file
-            webPrintln("");
-            return Error::Ok;
-        }
-        // execute the first line now; Protocol.cpp handles later ones when sdCard._readyNext
-        report_status_message(execute_line(fileLine, client, sdCard->getAuthLevel()), client);
-        report_realtime_status(client);
+        //report_realtime_status(out);
         return Error::Ok;
     }
 
-    static Error deleteObject(fs::FS fs, char* name) {
-        name = trim(name);
-        if (*name == '\0') {
-            webPrintln("Missing file name!");
-            return Error::InvalidValue;
+    static Error runSDFile(char* parameter, AuthenticationLevel auth_level, Channel& out) {  // ESP220
+        return runFile("sd", parameter, auth_level, out);
+    }
+
+    // Used by js/controls.js
+    static Error runLocalFile(char* parameter, AuthenticationLevel auth_level, Channel& out) {  // ESP700
+        return runFile("", parameter, auth_level, out);
+    }
+
+    static Error deleteObject(const char* fs, char* name, Channel& out) {
+        std::error_code ec;
+
+        FluidPath fpath { name, fs, ec };
+        if (ec) {
+            log_to(out, "No SD");
+            return Error::FsFailedMount;
         }
-        String path = name;
-        if (name[0] != '/') {
-            path = "/" + path;
-        }
-        File file2del = fs.open(path);
-        if (!file2del) {
-            webPrintln("Cannot find file!");
+        auto isDir = stdfs::is_directory(fpath, ec);
+        if (ec) {
+            log_to(out, "Delete failed: ", ec.message());
             return Error::FsFileNotFound;
         }
-        if (file2del.isDirectory()) {
-            if (!fs.rmdir(path)) {
-                webPrintln("Cannot delete directory! Is directory empty?");
+        if (isDir) {
+            stdfs::remove_all(fpath, ec);
+            fpath.rehash_fs();
+            if (ec) {
+                log_to(out, "Delete Directory failed: ", ec.message());
                 return Error::FsFailedDelDir;
             }
-            webPrintln("Directory deleted.");
         } else {
-            if (!fs.remove(path)) {
-                webPrintln("Cannot delete file!");
+            stdfs::remove(fpath, ec);
+            fpath.rehash_fs();
+            if (ec) {
+                log_to(out, "Delete File failed: ", ec.message());
                 return Error::FsFailedDelFile;
             }
-            webPrintln("File deleted.");
         }
-        file2del.close();
+
         return Error::Ok;
     }
 
-    static Error deleteSDObject(char* parameter, AuthenticationLevel auth_level) {  // ESP215
-        auto state = config->_sdCard->begin(SDCard::State::BusyWriting);
-        if (state != SDCard::State::Idle) {
-            webPrintln((state == SDCard::State::NotPresent) ? "No SD card" : "Busy");
-            return Error::Ok;
-        }
-        Error res = deleteObject(SD, parameter);
-        config->_sdCard->end();
-        return res;
+    static Error deleteSDObject(char* parameter, AuthenticationLevel auth_level, Channel& out) {  // ESP215
+        return deleteObject(sdName, parameter, out);
     }
 
-    static Error listSDFiles(char* parameter, AuthenticationLevel auth_level) {  // ESP210
-        switch (config->_sdCard->begin(SDCard::State::BusyReading)) {
-            case SDCard::State::Idle:
-                break;
-            case SDCard::State::NotPresent:
-                webPrintln("No SD Card");
+    static Error deleteLocalFile(char* parameter, AuthenticationLevel auth_level, Channel& out) {
+        return deleteObject(localfsName, parameter, out);
+    }
+
+    static Error listFilesystem(const char* fs, const char* value, WebUI::AuthenticationLevel auth_level, Channel& out) {
+        std::error_code ec;
+
+        FluidPath fpath { value, fs, ec };
+        if (ec) {
+            log_to(out, "No SD card");
+            return Error::FsFailedMount;
+        }
+
+        auto iter = stdfs::recursive_directory_iterator { fpath, ec };
+        if (ec) {
+            log_to(out, "Error: ", ec.message());
+            return Error::FsFailedMount;
+        }
+        for (auto const& dir_entry : iter) {
+            if (dir_entry.is_directory()) {
+                log_to(out, "[DIR:", std::string(iter.depth(), ' ').c_str() << dir_entry.path().filename());
+            } else {
+                log_to(out,
+                       "[FILE: ",
+                       std::string(iter.depth(), ' ').c_str() << dir_entry.path().filename() << "|SIZE:" << dir_entry.file_size());
+            }
+        }
+        auto space = stdfs::space(fpath, ec);
+        if (ec) {
+            log_to(out, "Error ", ec.value() << " " << ec.message());
+            return Error::FsFailedMount;
+        }
+
+        auto totalBytes = space.capacity;
+        auto freeBytes  = space.available;
+        auto usedBytes  = totalBytes - freeBytes;
+        log_to(out,
+               "[",
+               fpath.c_str() << " Free:" << formatBytes(freeBytes) << " Used:" << formatBytes(usedBytes)
+                             << " Total:" << formatBytes(totalBytes));
+        return Error::Ok;
+    }
+
+    static Error listSDFiles(char* parameter, AuthenticationLevel auth_level, Channel& out) {  // ESP210
+        return listFilesystem(sdName, parameter, auth_level, out);
+    }
+
+    static Error listLocalFiles(char* parameter, AuthenticationLevel auth_level, Channel& out) {  // No ESP command
+        return listFilesystem(localfsName, parameter, auth_level, out);
+    }
+
+    static Error copyFile(const char* ipath, const char* opath, Channel& out) {  // No ESP command
+        try {
+            FileStream outFile { opath, "w" };
+            FileStream inFile { ipath, "r" };
+            uint8_t    buf[512];
+            size_t     len;
+            while ((len = inFile.read(buf, 512)) > 0) {
+                outFile.write(buf, len);
+            }
+            outFile.fpath().rehash_fs();
+        } catch (const Error err) {
+            log_error("Cannot create file " << opath);
+            return Error::FsFailedCreateFile;
+        }
+        return Error::Ok;
+    }
+    static Error copyDir(const char* iDir, const char* oDir, Channel& out) {  // No ESP command
+        std::error_code ec;
+
+        {  // Block to manage scope of outDir
+            FluidPath outDir { oDir, "", ec };
+            if (ec) {
+                log_error_to(out, "Cannot mount /sd");
                 return Error::FsFailedMount;
-            default:
-                webPrintln("SD Card Busy");
-                return Error::FsFailedBusy;
-        }
+            }
 
-        webPrintln("");
-        config->_sdCard->listDir(SD, "/", 10, *webresponse);
-        String ssd = "[SD Free:" + formatBytes(SD.totalBytes() - SD.usedBytes());
-        ssd += " Used:" + formatBytes(SD.usedBytes());
-        ssd += " Total:" + formatBytes(SD.totalBytes());
-        ssd += "]";
-        webPrintln(ssd);
-        config->_sdCard->end();
-        return Error::Ok;
-    }
-
-    void listDirLocalFS(fs::FS fs, const char* dirname, size_t levels, Print& client) {
-        //char temp_filename[128]; // to help filter by extension	TODO: 128 needs a definition based on something
-        File root = fs.open(dirname);
-        if (!root) {
-            //FIXME: need proper error for FS and not usd sd one
-            report_status_message(Error::FsFailedOpenDir, client);
-            return;
-        }
-        if (!root.isDirectory()) {
-            //FIXME: need proper error for FS and not usd sd one
-            report_status_message(Error::FsDirNotFound, client);
-            return;
-        }
-        File file = root.openNextFile();
-        while (file) {
-            if (file.isDirectory()) {
-                if (levels) {
-                    listDirLocalFS(fs, file.name(), levels - 1, client);
+            if (outDir.hasTail()) {
+                stdfs::create_directory(outDir, ec);
+                if (ec) {
+                    log_error_to(out, "Cannot create " << oDir);
+                    return Error::FsFailedOpenDir;
                 }
-            } else {
-                allClients << "[FILE:" << file.name() << "|SIZE:" << file.size() << "]\n";
             }
-            file = root.openNextFile();
         }
-    }
 
-    static Error deleteLocalFile(char* parameter, AuthenticationLevel auth_level) { return deleteObject(SPIFFS, parameter); }
+        FluidPath fpath { iDir, "", ec };
+        if (ec) {
+            log_error_to(out, "Cannot open " << iDir);
+            return Error::FsFailedMount;
+        }
 
-    static Error listLocalFiles(char* parameter, AuthenticationLevel auth_level) {  // No ESP command
-        webPrintln("");
-        listDirLocalFS(SPIFFS, "/", 10, *webresponse);
-        String ssd = "[Local FS Free:" + formatBytes(SPIFFS.totalBytes() - SPIFFS.usedBytes());
-        ssd += " Used:" + formatBytes(SPIFFS.usedBytes());
-        ssd += " Total:" + formatBytes(SPIFFS.totalBytes());
-        ssd += "]";
-        webPrintln(ssd);
-        return Error::Ok;
-    }
-
-    static void listDirJSON(fs::FS fs, const char* dirname, size_t levels, JSONencoder* j) {
-        File root = fs.open(dirname);
-        File file = root.openNextFile();
-        while (file) {
-            const char* tailName = strchr(file.name(), '/');
-            tailName             = tailName ? tailName + 1 : file.name();
-            if (file.isDirectory() && levels) {
-                j->begin_array(tailName);
-                listDirJSON(fs, file.name(), levels - 1, j);
-                j->end_array();
+        auto iter = stdfs::directory_iterator { fpath, ec };
+        if (ec) {
+            log_error_to(out, fpath << " " << ec.message());
+            return Error::FsFailedMount;
+        }
+        Error err = Error::Ok;
+        for (auto const& dir_entry : iter) {
+            if (dir_entry.is_directory()) {
+                log_error("Not handling localfs subdirectories");
             } else {
-                j->begin_object();
-                j->member("name", tailName);
-                j->member("size", file.size());
-                j->end_object();
+                std::string opath(oDir);
+                opath += "/";
+                opath += dir_entry.path().filename().c_str();
+                std::string ipath(iDir);
+                ipath += "/";
+                ipath += dir_entry.path().filename().c_str();
+                log_info_to(out, ipath << " -> " << opath);
+                auto err1 = copyFile(ipath.c_str(), opath.c_str(), out);
+                if (err1 != Error::Ok) {
+                    err = err1;
+                }
             }
-            file = root.openNextFile();
         }
+        return err;
     }
-
-    static Error listLocalFilesJSON(char* parameter, AuthenticationLevel auth_level) {  // No ESP command
-        JSONencoder j(false, webresponse);
-        j.begin();
-        j.begin_array("files");
-        listDirJSON(SPIFFS, "/", 4, &j);
-        j.end_array();
-        j.member("total", SPIFFS.totalBytes());
-        j.member("used", SPIFFS.usedBytes());
-        j.member("occupation", String(100 * SPIFFS.usedBytes() / SPIFFS.totalBytes()));
-        j.end();
+    static Error showLocalFSHashes(char* parameter, WebUI::AuthenticationLevel auth_level, Channel& out) {
+        for (const auto& [name, hash] : HashFS::localFsHashes) {
+            log_info_to(out, name << ": " << hash);
+        }
         return Error::Ok;
     }
 
-    static Error showSDStatus(char* parameter, AuthenticationLevel auth_level) {  // ESP200
-        const char* resp = "No SD card";
-        switch (config->_sdCard->begin(SDCard::State::BusyReading)) {
-            case SDCard::State::Idle:
-                resp = "SD card detected";
-                config->_sdCard->end();
-                break;
-            case SDCard::State::NotPresent:
-                resp = "No SD card";
-                break;
-            default:
-                resp = "Busy";
+    static Error backupLocalFS(char* parameter, AuthenticationLevel auth_level, Channel& out) {  // No ESP command
+        return copyDir("/localfs", "/sd/localfs", out);
+    }
+    static Error restoreLocalFS(char* parameter, AuthenticationLevel auth_level, Channel& out) {  // No ESP command
+        return copyDir("/sd/localfs", "/localfs", out);
+    }
+    static Error migrateLocalFS(char* parameter, AuthenticationLevel auth_level, Channel& out) {  // No ESP command
+        const char* newfs = parameter && *parameter ? parameter : "littlefs";
+        if (strcmp(newfs, localfsName) == 0) {
+            log_error("localfs format is already " << newfs);
+            return Error::InvalidValue;
         }
-        webPrintln(resp);
+        log_info("Backing up local filesystem contents to SD");
+        Error err = copyDir("/localfs", "/sd/localfs", out);
+        if (err != Error::Ok) {
+            return err;
+        }
+        log_info("Reformatting local filesystem to " << newfs);
+        if (localfs_format(newfs)) {
+            return Error::FsFailedFormat;
+        }
+        log_info("Restoring local filesystem contents");
+        return copyDir("/sd/localfs", "/localfs", out);
+    }
+
+    // Used by js/files.js
+    static Error showSDStatus(char* parameter, AuthenticationLevel auth_level, Channel& out) {  // ESP200
+        std::error_code ec;
+
+        FluidPath path { "", "/sd", ec };
+        if (ec) {
+            log_to(out, "No SD card");
+            return Error::FsFailedMount;
+        }
+        log_to(out, "SD card detected");
         return Error::Ok;
     }
 
-    static Error setRadioState(char* parameter, AuthenticationLevel auth_level) {  // ESP115
+    static Error setRadioState(char* parameter, AuthenticationLevel auth_level, Channel& out) {  // ESP115
         parameter = trim(parameter);
         if (*parameter == '\0') {
             // Display the radio state
-            bool on = false;
-#ifdef ENABLE_WIFI
-            if (WiFi.getMode() != WIFI_MODE_NULL) {
-                on = true;
-            }
-#endif
-
-#ifdef ENABLE_BLUETOOTH
-            if (config->_comms->_bluetoothConfig && config->_comms->_bluetoothConfig->Is_BT_on()) {
-                on = true;
-            }
-#endif
-
-            webPrintln(on ? "ON" : "OFF");
+            bool on = wifi_config.isOn() || bt_config.isOn();
+            log_to(out, on ? "ON" : "OFF");
             return Error::Ok;
         }
         int8_t on = -1;
@@ -868,188 +563,50 @@ namespace WebUI {
             on = 0;
         }
         if (on == -1) {
-            webPrintln("only ON or OFF mode supported!");
+            log_to(out, "only ON or OFF mode supported!");
             return Error::InvalidValue;
         }
 
         //Stop everything
-#ifdef ENABLE_WIFI
-        if (WiFi.getMode() != WIFI_MODE_NULL) {
-            wifi_config.StopWiFi();
-        }
-#endif
-#ifdef ENABLE_BLUETOOTH
-        if (config->_comms->_bluetoothConfig && config->_comms->_bluetoothConfig->Is_BT_on()) {
-            config->_comms->_bluetoothConfig->end();
-        }
-#endif
+        wifi_config.end();
+        bt_config.end();
 
         //if On start proper service
-        if (!on) {
-            webPrintln("[MSG: Radio is Off]");
+        if (on && (wifi_config.begin() || bt_config.begin())) {
             return Error::Ok;
         }
-
-#ifdef ENABLE_WIFI
-        //On
-        if (wifi_config.begin()) {
-            return Error::Ok;
-        }
-#endif
-
-#ifdef ENABLE_BLUETOOTH
-        if (config->_comms->_bluetoothConfig) {
-            config->_comms->_bluetoothConfig->begin();
-        }
-#endif
-
-        webPrintln("[MSG: Radio is Off]");
+        log_msg_to(out, "Radio is Off");
         return Error::Ok;
     }
 
-#ifdef ENABLE_WIFI
-    static Error showIP(char* parameter, AuthenticationLevel auth_level) {  // ESP111
-        webPrintln(parameter, WiFi.getMode() == WIFI_STA ? WiFi.localIP() : WiFi.softAPIP());
-        return Error::Ok;
-    }
-
-    static Error showSetStaParams(char* parameter, AuthenticationLevel auth_level) {  // ESP103
-        if (*parameter == '\0') {
-            auto sta = config->_comms->_staConfig;
-            if (sta) {
-                webPrint("IP:", IPAddress(sta->_ipAddress));
-                webPrint(" GW:", IPAddress(sta->_gateway));
-                webPrintln(" MSK:", IPAddress(sta->_netmask));
-            } else {
-                const char* none = "<none>";
-                webPrint("IP:", none);
-                webPrint(" GW:", none);
-                webPrintln(" MSK:", none);
-            }
-            return Error::Ok;
-        }
-        if (!split_params(parameter)) {
-            return Error::InvalidValue;
-        }
-        char* gateway = get_param("GW", false);
-        char* netmask = get_param("MSK", false);
-        char* ip      = get_param("IP", false);
-
-        auto sta = config->_comms->_staConfig;
-        if (!sta) {
-            sta = config->_comms->_staConfig = new Machine::WifiSTAConfig();
-        }
-
-        IPAddress ipv;
-
-        if (!ipv.fromString(ip)) {
-            return Error::InvalidValue;
-        }
-        sta->_ipAddress = ipv;
-
-        if (!ipv.fromString(netmask)) {
-            return Error::InvalidValue;
-        }
-        sta->_netmask = ipv;
-
-        if (!ipv.fromString(gateway)) {
-            return Error::InvalidValue;
-        }
-        sta->_gateway = ipv;
-
-        return Error::Ok;
-    }
-#endif
-
-    static Error showWebHelp(char* parameter, AuthenticationLevel auth_level) {  // ESP0
-        webPrintln("Persistent web settings - $name to show, $name=value to set");
-        webPrintln("ESPname FullName         Description");
-        webPrintln("------- --------         -----------");
-        for (Setting* s = Setting::List; s; s = s->next()) {
-            if (s->getType() == WEBSET) {
-                if (s->getGrblName()) {
-                    webPrint(" ", s->getGrblName());
-                }
-                webPrintSetColumn(8);
-                webPrint(s->getName());
-                webPrintSetColumn(25);
-                webPrintln(s->getDescription());
+    static Error showWebHelp(char* parameter, AuthenticationLevel auth_level, Channel& out) {  // ESP0
+        log_to(out, "Persistent web settings - $name to show, $name=value to set");
+        log_to(out, "ESPname FullName         Description");
+        log_to(out, "------- --------         -----------");
+        ;
+        for (Setting* setting = Setting::List; setting; setting = setting->next()) {
+            if (setting->getType() == WEBSET) {
+                log_to(out,
+                       "",
+                       LeftJustify(setting->getGrblName() ? setting->getGrblName() : "", 8)
+                           << LeftJustify(setting->getName(), 25 - 8) << setting->getDescription());
             }
         }
-        webPrintln("");
-        webPrintln("Other web commands: $name to show, $name=value to set");
-        webPrintln("ESPname FullName         Values");
-        webPrintln("------- --------         ------");
+        log_to(out, "");
+        log_to(out, "Other web commands: $name to show, $name=value to set");
+        log_to(out, "ESPname FullName         Values");
+        log_to(out, "------- --------         ------");
+
         for (Command* cp = Command::List; cp; cp = cp->next()) {
             if (cp->getType() == WEBCMD) {
-                if (cp->getGrblName()) {
-                    webPrint(" ", cp->getGrblName());
-                }
-                webPrintSetColumn(8);
-                webPrint(cp->getName());
+                LogStream s(out, "");
+                s << LeftJustify(cp->getGrblName() ? cp->getGrblName() : "", 8) << LeftJustify(cp->getName(), 25 - 8);
                 if (cp->getDescription()) {
-                    webPrintSetColumn(25);
-                    webPrintln(cp->getDescription());
-                } else {
-                    webPrintln("");
+                    s << cp->getDescription();
                 }
             }
         }
         return Error::Ok;
-    }
-
-    void make_wifi_settings() {
-#ifdef ENABLE_WIFI
-        new WebCommand(
-            "TYPE=NONE|PUSHOVER|EMAIL|LINE T1=token1 T2=token2 TS=settings", WEBCMD, WA, "ESP610", "Notification/Setup", showSetNotification);
-        notification_ts = new StringSetting(
-            "Notification Settings", WEBSET, WA, NULL, "Notification/TS", DEFAULT_TOKEN, 0, MAX_NOTIFICATION_SETTING_LENGTH, NULL);
-        notification_t2   = new StringSetting("Notification Token 2",
-                                            WEBSET,
-                                            WA,
-                                            NULL,
-                                            "Notification/T2",
-                                            DEFAULT_TOKEN,
-                                            MIN_NOTIFICATION_TOKEN_LENGTH,
-                                            MAX_NOTIFICATION_TOKEN_LENGTH,
-                                            NULL);
-        notification_t1   = new StringSetting("Notification Token 1",
-                                            WEBSET,
-                                            WA,
-                                            NULL,
-                                            "Notification/T1",
-                                            DEFAULT_TOKEN,
-                                            MIN_NOTIFICATION_TOKEN_LENGTH,
-                                            MAX_NOTIFICATION_TOKEN_LENGTH,
-                                            NULL);
-        notification_type = new EnumSetting(
-            "Notification type", WEBSET, WA, NULL, "Notification/Type", DEFAULT_NOTIFICATION_TYPE, &notificationOptions, NULL);
-        new WebCommand("message", WEBCMD, WU, "ESP600", "Notification/Send", sendMessage);
-
-        new WebCommand(NULL, WEBCMD, WU, "ESP410", "WiFi/ListAPs", listAPs);
-        new WebCommand(NULL, WEBCMD, WG, "ESP111", "System/IP", showIP);
-        new WebCommand("IP=ipaddress MSK=netmask GW=gateway", WEBCMD, WA, "ESP103", "Sta/Setup", showSetStaParams);
-        // no get, admin to set
-        wifi_ap_password = new StringSetting("AP Password",
-                                             WEBSET,
-                                             WA,
-                                             "ESP106",
-                                             "AP/Password",
-                                             DEFAULT_AP_PWD,
-                                             MIN_PASSWORD_LENGTH,
-                                             MAX_PASSWORD_LENGTH,
-                                             (bool (*)(char*))WiFiConfig::isPasswordValid);
-        // no get, admin to set
-        wifi_sta_password = new StringSetting("Station Password",
-                                              WEBSET,
-                                              WA,
-                                              "ESP101",
-                                              "Sta/Password",
-                                              DEFAULT_STA_PWD,
-                                              MIN_PASSWORD_LENGTH,
-                                              MAX_PASSWORD_LENGTH,
-                                              (bool (*)(char*))WiFiConfig::isPasswordValid);
-#endif
     }
 
     void make_authentication_settings() {
@@ -1077,7 +634,6 @@ namespace WebUI {
     }
 
     void make_web_settings() {
-        make_wifi_settings();
         make_authentication_settings();
         // If authentication enabled, display_settings skips or displays <Authentication Required>
         // RU - need user or admin password to read
@@ -1088,13 +644,19 @@ namespace WebUI {
         new WebCommand("RESTART", WEBCMD, WA, "ESP444", "System/Control", setSystemMode);
         new WebCommand("RESTART", WEBCMD, WA, NULL, "Bye", restart);
 
-        new WebCommand(NULL, WEBCMD, WU, "ESP720", "LocalFS/Size", SPIFFSSize);
-        new WebCommand("FORMAT", WEBCMD, WA, "ESP710", "LocalFS/Format", formatSpiffs);
+        new WebCommand(NULL, WEBCMD, WU, "ESP720", "LocalFS/Size", localFSSize);
+        new WebCommand("FORMAT", WEBCMD, WA, "ESP710", "LocalFS/Format", formatLocalFS);
         new WebCommand("path", WEBCMD, WU, "ESP701", "LocalFS/Show", showLocalFile);
         new WebCommand("path", WEBCMD, WU, "ESP700", "LocalFS/Run", runLocalFile);
         new WebCommand("path", WEBCMD, WU, NULL, "LocalFS/List", listLocalFiles);
+#if 0
         new WebCommand("path", WEBCMD, WU, NULL, "LocalFS/ListJSON", listLocalFilesJSON);
+#endif
         new WebCommand("path", WEBCMD, WU, NULL, "LocalFS/Delete", deleteLocalFile);
+        new WebCommand("path", WEBCMD, WU, NULL, "LocalFS/Backup", backupLocalFS);
+        new WebCommand("path", WEBCMD, WU, NULL, "LocalFS/Restore", restoreLocalFS);
+        new WebCommand("path", WEBCMD, WU, NULL, "LocalFS/Migrate", migrateLocalFS);
+        new WebCommand(NULL, WEBCMD, WU, NULL, "LocalFS/Hashes", showLocalFSHashes);
 
         new WebCommand("path", WEBCMD, WU, "ESP221", "SD/Show", showSDFile);
         new WebCommand("path", WEBCMD, WU, "ESP220", "SD/Run", runSDFile);

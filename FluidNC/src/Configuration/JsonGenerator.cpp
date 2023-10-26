@@ -8,6 +8,8 @@
 #include <cstring>
 #include <cstdio>
 #include <atomic>
+#include <sstream>
+#include <iomanip>
 
 namespace Configuration {
     JsonGenerator::JsonGenerator(WebUI::JSONencoder& encoder) : _encoder(encoder) {
@@ -50,13 +52,13 @@ namespace Configuration {
 
     void JsonGenerator::item(const char* name, bool& value) {
         enter(name);
-        const char* val = value ? "Yes" : "No";
-        _encoder.begin_webui(name, _currentPath, "B", val);
+        const char* val = value ? "1" : "0";
+        _encoder.begin_webui(_currentPath, _currentPath, "B", val);
         _encoder.begin_array("O");
         {
             _encoder.begin_object();
-            _encoder.member("No", 0);
-            _encoder.member("Yes", 1);
+            _encoder.member("False", 0);
+            _encoder.member("True", 1);
             _encoder.end_object();
         }
         _encoder.end_array();
@@ -68,7 +70,16 @@ namespace Configuration {
         enter(name);
         char buf[32];
         itoa(value, buf, 10);
-        _encoder.begin_webui(name, _currentPath, "I", buf, minValue, maxValue);
+        _encoder.begin_webui(_currentPath, _currentPath, "I", buf, minValue, maxValue);
+        _encoder.end_object();
+        leave();
+    }
+
+    void JsonGenerator::item(const char* name, uint32_t& value, uint32_t minValue, uint32_t maxValue) {
+        enter(name);
+        char buf[32];
+        itoa(value, buf, 10);
+        _encoder.begin_webui(_currentPath, _currentPath, "I", buf, minValue, maxValue);
         _encoder.end_object();
         leave();
     }
@@ -76,7 +87,14 @@ namespace Configuration {
     void JsonGenerator::item(const char* name, float& value, float minValue, float maxValue) {
         enter(name);
         // WebUI does not explicitly recognize the R type, but nevertheless handles it correctly.
-        _encoder.begin_webui(name, _currentPath, "R", String(value, 3).c_str());
+        if (value > 999999.999f) {
+            value = 999999.999f;
+        } else if (value < -999999.999f) {
+            value = -999999.999f;
+        }
+        std::ostringstream fstr;
+        fstr << std::fixed << std::setprecision(3) << value;
+        _encoder.begin_webui(_currentPath, _currentPath, "R", fstr.str());
         _encoder.end_object();
         leave();
     }
@@ -86,9 +104,9 @@ namespace Configuration {
         // Not sure if I should comment this out or not. The implementation is similar to the one in Generator.h.
     }
 
-    void JsonGenerator::item(const char* name, String& value, int minLength, int maxLength) {
+    void JsonGenerator::item(const char* name, std::string& value, int minLength, int maxLength) {
         enter(name);
-        _encoder.begin_webui(name, _currentPath, "S", value.c_str(), minLength, maxLength);
+        _encoder.begin_webui(_currentPath, _currentPath, "S", value.c_str(), minLength, maxLength);
         _encoder.end_object();
         leave();
     }
@@ -99,7 +117,7 @@ namespace Configuration {
         /*
         enter(name);
         auto sv = value.name();
-        _encoder.begin_webui(name, _currentPath, "S", sv.c_str(), 0, 255);
+        _encoder.begin_webui(_currentPath, _currentPath, "S", sv.c_str(), 0, 255);
         _encoder.end_object();
         leave();
         */
@@ -107,26 +125,28 @@ namespace Configuration {
 
     void JsonGenerator::item(const char* name, IPAddress& value) {
         enter(name);
-        _encoder.begin_webui(name, _currentPath, "A", value.toString().c_str());
+        _encoder.begin_webui(_currentPath, _currentPath, "A", IP_string(value));
         _encoder.end_object();
         leave();
     }
 
     void JsonGenerator::item(const char* name, int& value, EnumItem* e) {
         enter(name);
-        const char* str = "unknown";
-        for (; e->name; ++e) {
-            if (value == e->value) {
-                str = e->name;
+        int selected_val = 0;
+        //const char* str          = "unknown";
+        for (auto e2 = e; e2->name; ++e2) {
+            if (value == e2->value) {
+                //str          = e2->name;
+                selected_val = e2->value;
                 break;
             }
         }
 
-        _encoder.begin_webui(name, _currentPath, "B", str);
+        _encoder.begin_webui(_currentPath, _currentPath, "B", selected_val);
         _encoder.begin_array("O");
-        for (; e->name; ++e) {
+        for (auto e2 = e; e2->name; ++e2) {
             _encoder.begin_object();
-            _encoder.member(e->name, e->value);
+            _encoder.member(e2->name, e2->value);
             _encoder.end_object();
         }
         _encoder.end_array();

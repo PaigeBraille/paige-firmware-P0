@@ -8,14 +8,18 @@
   Serial.h - Header for system level commands and real-time processes
 */
 
+#include "Config.h"
 #include <vector>
 #include <stdint.h>
-#include <Stream.h>
+#include "Channel.h"
+#include <freertos/FreeRTOS.h>  // TickType_T
+#include <freertos/queue.h>
+#include <mutex>
 
 // See if the character is an action command like feedhold or jogging. If so, do the action and return true
 uint8_t check_action_command(uint8_t data);
 
-void client_init();
+void channel_init();
 
 // Define realtime command special characters. These characters are 'picked-off' directly from the
 // serial read data stream and are not passed to the grbl line execution parser. Select characters
@@ -30,6 +34,7 @@ void client_init();
 // space, serial.c's RX ISR will need to be modified to accommodate the change.
 
 enum class Cmd : uint8_t {
+    None                  = 0,
     Reset                 = 0x18,  // Ctrl-X
     StatusReport          = '?',
     CycleStart            = '~',
@@ -37,6 +42,10 @@ enum class Cmd : uint8_t {
     SafetyDoor            = 0x84,
     JogCancel             = 0x85,
     DebugReport           = 0x86,  // Only when DEBUG_REPORT_REALTIME enabled, sends debug report in '{}' braces.
+    Macro0                = 0x87,
+    Macro1                = 0x88,
+    Macro2                = 0x89,
+    Macro3                = 0x8a,
     FeedOvrReset          = 0x90,  // Restores feed override value to 100%.
     FeedOvrCoarsePlus     = 0x91,
     FeedOvrCoarseMinus    = 0x92,
@@ -57,25 +66,40 @@ enum class Cmd : uint8_t {
 };
 
 bool is_realtime_command(uint8_t data);
+void execute_realtime_command(Cmd command, Channel& channel);
 
-class InputClient {
-public:
-    static const int maxLine = 255;
-    InputClient(Stream* source) : _in(source), _out(source), _linelen(0), _line_num(0), _line_returned(false) {}
-    Stream* _in;
-    Print*  _out;
-    char    _line[maxLine];
-    size_t  _linelen;
-    int     _line_num;
-    bool    _line_returned;
-};
-InputClient* pollClients();
+Channel* pollChannels(char* line = nullptr);
 
-class AllClients : public Print {
+class AllChannels : public Channel {
+    std::vector<Channel*> _channelq;
+
+    Channel*     _lastChannel = nullptr;
+    xQueueHandle _killQueue;
+
+    static std::mutex _mutex;
+
 public:
-    AllClients() = default;
+    AllChannels() : Channel("all") { _killQueue = xQueueCreate(3, sizeof(Channel*)); }
+
+    void kill(Channel* channel);
+
+    void registration(Channel* channel);
+    void deregistration(Channel* channel);
+    void init();
+
     size_t write(uint8_t data) override;
     size_t write(const uint8_t* buffer, size_t length) override;
+
+    void flushRx();
+
+    void notifyWco();
+    void notifyNgc(CoordIndex coord);
+
+    void listChannels(Channel& out);
+
+    Channel* pollLine(char* line) override;
+
+    void stopJob() override;
 };
 
-extern AllClients allClients;
+extern AllChannels allChannels;

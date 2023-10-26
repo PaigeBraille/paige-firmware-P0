@@ -4,12 +4,16 @@
 
 #include "MachineConfig.h"
 
+#include "../Kinematics/Kinematics.h"
+
 #include "../Motors/MotorDriver.h"
 #include "../Motors/NullMotor.h"
 
 #include "../Spindles/NullSpindle.h"
+#include "../UartChannel.h"
 
-#include "../Logging.h"
+#include "../SettingsDefinitions.h"  // config_filename
+#include "../FileStream.h"
 
 #include "../Configuration/Parser.h"
 #include "../Configuration/ParserHandler.h"
@@ -18,7 +22,6 @@
 #include "../Configuration/ParseException.h"
 #include "../Config.h"  // ENABLE_*
 
-#include <SPIFFS.h>
 #include <cstdio>
 #include <cstring>
 #include <atomic>
@@ -31,35 +34,50 @@ namespace Machine {
     void MachineConfig::group(Configuration::HandlerBase& handler) {
         handler.item("board", _board);
         handler.item("name", _name);
+        handler.item("meta", _meta);
 
         handler.section("stepping", _stepping);
-        handler.section("axes", _axes);
+
+        handler.section("uart1", _uarts[1], 1);
+        handler.section("uart2", _uarts[2], 2);
+
+        handler.section("uart_channel1", _uart_channels[1]);
+        handler.section("uart_channel2", _uart_channels[2]);
+
         handler.section("i2so", _i2so);
+
+        handler.section("i2c0", _i2c[0], 0);
+        handler.section("i2c1", _i2c[1], 1);
+
         handler.section("spi", _spi);
+        handler.section("sdcard", _sdCard);
+
+        handler.section("kinematics", _kinematics);
+        handler.section("axes", _axes);
+
         handler.section("control", _control);
         handler.section("coolant", _coolant);
         handler.section("probe", _probe);
-        handler.section("comms", _comms);
         handler.section("macros", _macros);
+        handler.section("extenders", _extenders);
+        handler.section("start", _start);
+        handler.section("parking", _parking);
 
         handler.section("user_outputs", _userOutputs);
-        handler.section("sdcard", _sdCard);
-        handler.item("software_debounce_ms", _softwareDebounceMs);
-        // TODO: Consider putting these under a gcode: hierarchy level? Or motion control?
-        handler.item("laser_mode", _laserMode);
-        handler.item("arc_tolerance", _arcTolerance);
-        handler.item("junction_deviation", _junctionDeviation);
-        handler.item("verbose_errors", _verboseErrors);
-        handler.item("report_inches", _reportInches);
-        handler.item("homing_init_lock", _homingInitLock);
-        handler.item("enable_parking_override_control", _enableParkingOverrideControl);
-        handler.item("deactivate_parking_upon_init", _deactivateParkingUponInit);
-        handler.item("check_limits_at_init", _checkLimitsAtInit);
-        handler.item("limits_two_switches_on_axis", _limitsTwoSwitchesOnAxis);
-        handler.item("disable_laser_during_hold", _disableLaserDuringHold);
-        handler.item("use_line_numbers", _useLineNumbers);
+
+        handler.section("oled", _oled);
 
         Spindles::SpindleFactory::factory(handler, _spindles);
+        Listeners::SysListenerFactory::factory(handler, _sysListeners);
+
+        // TODO: Consider putting these under a gcode: hierarchy level? Or motion control?
+        handler.item("arc_tolerance_mm", _arcTolerance, 0.001, 1.0);
+        handler.item("junction_deviation_mm", _junctionDeviation, 0.01, 1.0);
+        handler.item("verbose_errors", _verboseErrors);
+        handler.item("report_inches", _reportInches);
+        handler.item("enable_parking_override_control", _enableParkingOverrideControl);
+        handler.item("use_line_numbers", _useLineNumbers);
+        handler.item("planner_blocks", _planner_blocks, 10, 120);
     }
 
     void MachineConfig::afterParse() {
@@ -69,12 +87,14 @@ namespace Machine {
         }
 
         if (_coolant == nullptr) {
-            log_info("Coolant: using defaults");
             _coolant = new CoolantControl();
         }
 
+        if (_kinematics == nullptr) {
+            _kinematics = new Kinematics();
+        }
+
         if (_probe == nullptr) {
-            log_info("Probe: using defaults");
             _probe = new Probe();
         }
 
@@ -98,12 +118,18 @@ namespace Machine {
         // Only if an i2so section is present will config->_i2so be non-null
 
         if (_control == nullptr) {
-            log_info("Control: using defaults");
             _control = new Control();
         }
 
+        if (_start == nullptr) {
+            _start = new Start();
+        }
+
+        if (_parking == nullptr) {
+            _parking = new Parking();
+        }
+
         if (_spindles.size() == 0) {
-            log_info("Spindle: using defaults (no spindle)");
             _spindles.push_back(new Spindles::Null());
         }
 
@@ -118,112 +144,63 @@ namespace Machine {
             }
         }
 
-        if (_comms == nullptr) {
-            log_info("Comms: using defaults");
-            _comms = new Communications();
-#ifdef ENABLE_WIFI
-            _comms->_apConfig = new WifiAPConfig();
-#endif
-        }
-
-#ifdef ENABLE_WIFI
-        // This is very helpful for testing YAML config files.  If things
-        // screw up, you can still connect and upload a new config.yaml
-        // TODO - Consider whether we want this for the long term
-        if (!_comms->_apConfig) {
-            _comms->_apConfig = new WifiAPConfig();
-        }
-#endif
-
         if (_macros == nullptr) {
             _macros = new Macros();
         }
     }
 
-    size_t MachineConfig::readFile(const char* filename, char*& buffer) {
-        String path = filename;
-        if ((path.length() > 0) && (path[0] != '/')) {
-            path = "/" + path;
-        }
-
-        File file = SPIFFS.open(path, FILE_READ);
-
-        // There is a subtle problem with the Arduino framework.  If
-        // the framework does not find the file, it tries to open the
-        // path as a directory.  SPIFFS_opendir(... path ...) always
-        // succeeds, regardless of what path is, hence the need to
-        // check that it is not a directory.
-
-        if (!file || file.isDirectory()) {
-            if (file) {
-                file.close();
-            }
-            log_error("Missing config file " << path);
-            return 0;
-        }
-
-        auto filesize = file.size();
-        if (filesize == 0) {
-            log_info("config file " << path << " is empty");
-            return 0;
-        }
-        // log_debug("Configuration file has " << int(filesize) << " bytes");
-        buffer = new char[filesize + 1];
-
-        size_t pos = 0;
-        while (pos < filesize) {
-            auto read = file.read((uint8_t*)(buffer + pos), filesize - pos);
-            if (read == 0) {
-                break;
-            }
-            pos += read;
-        }
-
-        file.close();
-        buffer[filesize] = 0;
-
-        // log_debug("Read config file:\n" << buffer);
-
-        if (pos != filesize) {
-            delete[] buffer;
-
-            log_error("Cannot read the config file");
-            return 0;
-        }
-        return filesize;
-    }
-
     char defaultConfig[] = "name: Default (Test Drive)\nboard: None\n";
 
-    bool MachineConfig::load(const char* filename) {
-        // log_info("Heap size before load config is " << uint32_t(xPortGetFreeHeapSize()));
-
+    bool MachineConfig::load() {
+        bool configOkay;
         // If the system crashes we skip the config file and use the default
         // builtin config.  This helps prevent reset loops on bad config files.
-        size_t             filesize = 0;
-        char*              buffer   = nullptr;
-        esp_reset_reason_t reason   = esp_reset_reason();
+        esp_reset_reason_t reason = esp_reset_reason();
         if (reason == ESP_RST_PANIC) {
-            log_debug("Skipping configuration file due to panic");
+            log_error("Skipping configuration file due to panic");
+            configOkay = false;
         } else {
-            filesize = readFile(filename, buffer);
+            configOkay = load(config_filename->get());
         }
 
-        StringRange* input = nullptr;
-
-        if (filesize > 0) {
-            input = new StringRange(buffer, buffer + filesize);
-            log_info("Configuration file: " << filename);
-
-        } else {
+        if (!configOkay) {
             log_info("Using default configuration");
-            input = new StringRange(defaultConfig);
+            configOkay = load(new StringRange(defaultConfig));
         }
-        // Process file:
+
+        return configOkay;
+    }
+
+    bool MachineConfig::load(const char* filename) {
+        try {
+            FileStream file(filename, "r", "");
+
+            auto filesize = file.size();
+            if (filesize <= 0) {
+                log_info("Configuration file:" << filename << " is empty");
+                return false;
+            }
+
+            char* buffer     = new char[filesize + 1];
+            buffer[filesize] = '\0';
+            auto actual      = file.read(buffer, filesize);
+            if (actual != filesize) {
+                log_info("Configuration file:" << filename << " read error");
+                return false;
+            }
+            log_info("Configuration file:" << filename);
+            bool retval = load(new StringRange(buffer, buffer + filesize));
+            delete[] buffer;
+            return retval;
+        } catch (...) {
+            log_warn("Cannot open configuration file:" << filename);
+            return false;
+        }
+    }
+
+    bool MachineConfig::load(StringRange* input) {
         bool successful = false;
         try {
-            // log_info("Heap size before parsing is " << uint32_t(xPortGetFreeHeapSize()));
-
             Configuration::Parser        parser(input->begin(), input->end());
             Configuration::ParserHandler handler(parser);
 
@@ -242,58 +219,43 @@ namespace Machine {
 
             log_debug("Running after-parse tasks");
 
-            // log_info("Heap size before after-parse is " << uint32_t(xPortGetFreeHeapSize()));
-
             try {
                 Configuration::AfterParse afterParse;
                 config->afterParse();
                 config->group(afterParse);
-            } catch (std::exception& ex) { log_info("Validation error: " << ex.what()); }
+            } catch (std::exception& ex) { log_error("Validation error: " << ex.what()); }
 
             log_debug("Checking configuration");
-
-            // log_info("Heap size before validation is " << uint32_t(xPortGetFreeHeapSize()));
 
             try {
                 Configuration::Validator validator;
                 config->validate();
                 config->group(validator);
-            } catch (std::exception& ex) { log_info("Validation error: " << ex.what()); }
+            } catch (std::exception& ex) { log_error("Validation error: " << ex.what()); }
 
             // log_info("Heap size after configuation load is " << uint32_t(xPortGetFreeHeapSize()));
 
-            successful = (sys.state != State::ConfigAlarm);
+            successful = (sys.state() != State::ConfigAlarm);
 
-            log_info("Configuration is " << (successful ? "valid" : "invalid"));
+            if (!successful) {
+                log_error("Configuration is invalid");
+            }
 
         } catch (const Configuration::ParseException& ex) {
-            sys.state      = State::ConfigAlarm;
-            auto startNear = ex.Near();
-            auto endNear   = (startNear + 10) > (buffer + filesize) ? (buffer + filesize) : (startNear + 10);
-
-            auto startKey = ex.KeyStart();
-            auto endKey   = ex.KeyEnd();
-
-            StringRange near(startNear, endNear);
-            StringRange key(startKey, endKey);
-            log_error("Configuration parse error: " << ex.What() << " @ " << ex.LineNumber() << ":" << ex.ColumnNumber() << " key "
-                                                    << key.str() << " near " << near.str());
+            sys.set_state(State::ConfigAlarm);
+            log_error("Configuration parse error on line " << ex.LineNumber() << ": " << ex.What());
         } catch (const AssertionFailed& ex) {
-            sys.state = State::ConfigAlarm;
+            sys.set_state(State::ConfigAlarm);
             // Get rid of buffer and return
             log_error("Configuration loading failed: " << ex.what());
         } catch (std::exception& ex) {
-            sys.state = State::ConfigAlarm;
+            sys.set_state(State::ConfigAlarm);
             // Log exception:
             log_error("Configuration validation error: " << ex.what());
         } catch (...) {
-            sys.state = State::ConfigAlarm;
+            sys.set_state(State::ConfigAlarm);
             // Get rid of buffer and return
             log_error("Unknown error while processing config file");
-        }
-
-        if (buffer) {
-            delete[] buffer;
         }
         delete[] input;
 
@@ -310,7 +272,6 @@ namespace Machine {
         delete _sdCard;
         delete _spi;
         delete _control;
-        delete _comms;
         delete _macros;
     }
 }

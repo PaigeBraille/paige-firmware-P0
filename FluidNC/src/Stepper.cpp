@@ -16,12 +16,15 @@
 #include "Planner.h"
 #include "Protocol.h"
 #include <esp_attr.h>  // IRAM_ATTR
+#include <cmath>
 
 using namespace Stepper;
 
+static bool awake = false;
+
 // Stores the planner block Bresenham algorithm execution data for the segments in the segment
 // buffer. Normally, this buffer is partially in-use, but, for the worst case scenario, it will
-// never exceed the number of accessible stepper buffer segments (SEGMENT_BUFFER_SIZE-1).
+// never exceed the number of accessible stepper buffer segments (config->_stepping->_segments-1).
 // NOTE: This data is copied from the prepped planner blocks so that the planner blocks may be
 // discarded when entirely consumed and completed by the segment buffer. Also, AMASS alters this
 // data for its own use.
@@ -31,7 +34,7 @@ struct st_block_t {
     uint8_t  direction_bits;
     bool     is_pwm_rate_adjusted;  // Tracks motions that require constant laser power/rate
 };
-static st_block_t st_block_buffer[SEGMENT_BUFFER_SIZE - 1];
+static volatile st_block_t* st_block_buffer = nullptr;
 
 // Primary stepper segment ring buffer. Contains small, short line segments for the stepper
 // algorithm to execute, which are "checked-out" incrementally from the first block in the
@@ -42,10 +45,21 @@ struct segment_t {
     uint16_t     isrPeriod;          // Time to next ISR tick, in units of timer ticks
     uint8_t      st_block_index;     // Stepper block data index. Uses this information to execute this segment.
     uint8_t      amass_level;        // AMASS level for the ISR to execute this segment
-    uint16_t     spindle_dev_speed;  // Spindle speed scaled to the device
+    uint32_t     spindle_dev_speed;  // Spindle speed scaled to the device
     SpindleSpeed spindle_speed;      // Spindle speed in GCode units
 };
-static segment_t segment_buffer[SEGMENT_BUFFER_SIZE];
+static segment_t* segment_buffer = nullptr;
+
+void Stepper::init() {
+    if (st_block_buffer) {
+        delete[] st_block_buffer;
+    }
+    st_block_buffer = new st_block_t[config->_stepping->_segments - 1];
+    if (segment_buffer) {
+        delete[] segment_buffer;
+    }
+    segment_buffer = new segment_t[config->_stepping->_segments];
+}
 
 // Stepper ISR data struct. Contains the running data for the main stepper ISR.
 typedef struct {
@@ -59,22 +73,22 @@ typedef struct {
     uint8_t  dir_outbits;
     uint32_t steps[MAX_N_AXIS];
 
-    uint16_t    step_count;        // Steps remaining in line segment motion
-    uint8_t     exec_block_index;  // Tracks the current st_block index. Change indicates new block.
-    st_block_t* exec_block;        // Pointer to the block data for the segment being executed
-    segment_t*  exec_segment;      // Pointer to the segment being executed
+    uint16_t             step_count;        // Steps remaining in line segment motion
+    uint8_t              exec_block_index;  // Tracks the current st_block index. Change indicates new block.
+    volatile st_block_t* exec_block;        // Pointer to the block data for the segment being executed
+    volatile segment_t*  exec_segment;      // Pointer to the segment being executed
 } stepper_t;
 static stepper_t st;
 
 // Step segment ring buffer indices
-static volatile uint8_t segment_buffer_tail;
-static uint8_t          segment_buffer_head;
-static uint8_t          segment_next_head;
+static volatile uint32_t segment_buffer_tail;
+static volatile uint32_t segment_buffer_head;
+static uint32_t          segment_next_head;
 
 // Pointers for the step segment being prepped from the planner buffer. Accessed only by the
 // main program. Pointers may be planning segments or planner blocks ahead of what being executed.
-static plan_block_t* pl_block;       // Pointer to the planner block being prepped
-static st_block_t*   st_prep_block;  // Pointer to the stepper block data being prepped
+static plan_block_t*        pl_block;       // Pointer to the planner block being prepped
+static volatile st_block_t* st_prep_block;  // Pointer to the stepper block data being prepped
 
 // Segment preparation data struct. Contains all the necessary information to compute new segments
 // based on the current executing planner block.
@@ -162,12 +176,14 @@ static st_prep_t prep;
 */
 
 // Stepper shutdown
-static void IRAM_ATTR stop_stepping() {
-    // Disable Stepping Driver Interrupt.
-    config->_stepping->stopTimer();
+void IRAM_ATTR Stepper::stop_stepping() {
     config->_axes->unstep();
     st.step_outbits = 0;
 }
+
+#ifdef DEBUG_STEPPER_ISR
+uint32_t Stepper::isr_count;  // for debugging only
+#endif
 
 /**
  * This phase of the ISR should ONLY create the pulses for the steppers.
@@ -175,8 +191,16 @@ static void IRAM_ATTR stop_stepping() {
  * interrupt and the start of the pulses. DON'T add any logic ahead of the
  * call to this method that might cause variation in the timing. The aim
  * is to keep pulse timing as regular as possible.
+ * Returns true if step interrupts should continue
  */
-void IRAM_ATTR Stepper::pulse_func() {
+bool IRAM_ATTR Stepper::pulse_func() {
+#ifdef DEBUG_STEPPER_ISR
+    isr_count++;
+#endif
+    // This is a precaution in case we get a spurious interrupt
+    if (!awake) {
+        return false;
+    }
     auto n_axis = config->_axes->_numberAxis;
 
     config->_axes->step(st.step_outbits, st.dir_outbits);
@@ -200,6 +224,7 @@ void IRAM_ATTR Stepper::pulse_func() {
                     st.counter[axis] = st.exec_block->step_event_count >> 1;
                 }
             }
+
             st.dir_outbits = st.exec_block->direction_bits;
             // Adjust Bresenham axis increment counters according to AMASS level.
             for (int axis = 0; axis < n_axis; axis++) {
@@ -210,23 +235,28 @@ void IRAM_ATTR Stepper::pulse_func() {
         } else {
             // Segment buffer empty. Shutdown.
             stop_stepping();
-            if (sys.state != State::Jog) {  // added to prevent ... jog after probing crash
+            if (sys.state() != State::Jog) {  // added to prevent ... jog after probing crash
                 // Ensure pwm is set properly upon completion of rate-controlled motion.
                 if (st.exec_block != NULL && st.exec_block->is_pwm_rate_adjusted) {
                     spindle->setSpeedfromISR(0);
                 }
             }
-            rtCycleStop = true;
-            return;  // Nothing to do but exit.
+
+            protocol_send_event_from_ISR(&cycleStopEvent);
+            awake = false;
+            return false;  // Nothing to do but exit.
         }
     }
 
     // Check probing state.
     if (probeState == ProbeState::Active && config->_probe->tripped()) {
         probeState = ProbeState::Off;
-        // Memcpy is not IRAM_ATTR, but: most compilers optimize memcpy away.
-        memcpy(probe_steps, motor_steps, sizeof(motor_steps));
-        rtMotionCancel = true;
+        auto axes  = config->_axes;
+        for (int axis = 0; axis < n_axis; axis++) {
+            auto m            = axes->_axis[axis]->_motors[0];
+            probe_steps[axis] = m ? m->_steps : 0;
+        }
+        protocol_send_event_from_ISR(&motionCancelEvent);
     }
 
     // Reset step out bits.
@@ -238,29 +268,28 @@ void IRAM_ATTR Stepper::pulse_func() {
         if (st.counter[axis] > st.exec_block->step_event_count) {
             set_bitnum(st.step_outbits, axis);
             st.counter[axis] -= st.exec_block->step_event_count;
-            if (bitnum_is_true(st.exec_block->direction_bits, axis)) {
-                motor_steps[axis]--;
-            } else {
-                motor_steps[axis]++;
-            }
         }
     }
 
     st.step_count--;  // Decrement step events count
     if (st.step_count == 0) {
         // Segment is complete. Discard current segment and advance segment indexing.
-        st.exec_segment = NULL;
-        if (++segment_buffer_tail == SEGMENT_BUFFER_SIZE) {
-            segment_buffer_tail = 0;
-        }
+        st.exec_segment     = NULL;
+        segment_buffer_tail = segment_buffer_tail >= (config->_stepping->_segments - 1) ? 0 : segment_buffer_tail + 1;
     }
 
     config->_axes->unstep();
+    return true;
 }
 
 // enabled. Startup init and limits call this function but shouldn't start the cycle.
 void Stepper::wake_up() {
-    //log_info("st_wake_up");
+    if (awake) {
+        return;
+    }
+    awake = true;
+    // Cancel any pending stepper disable
+    protocol_cancel_disable_steppers();
     // Enable stepper drivers.
     config->_axes->set_disable(false);
 
@@ -269,6 +298,7 @@ void Stepper::wake_up() {
 }
 
 void Stepper::go_idle() {
+    awake = false;
     stop_stepping();
     protocol_disable_steppers();
 }
@@ -294,12 +324,14 @@ void Stepper::reset() {
 }
 
 // Called by planner_recalculate() when the executing block is updated by the new plan.
-void Stepper::update_plan_block_parameters() {
+bool Stepper::update_plan_block_parameters() {
     if (pl_block != NULL) {  // Ignore if at start of a new block.
         prep.recalculate_flag.recalculate = 1;
         pl_block->entry_speed_sqr         = prep.current_speed * prep.current_speed;  // Update entry speed.
         pl_block                          = NULL;  // Flag prep_segment() to load and check active velocity profile.
+        return true;
     }
+    return false;
 }
 
 // Changes the run state of the step segment buffer to execute the special parking motion.
@@ -339,7 +371,7 @@ void Stepper::parking_restore_buffer() {
 // Increments the step segment buffer block data ring buffer.
 static uint8_t next_block_index(uint8_t block_index) {
     block_index++;
-    return block_index == (SEGMENT_BUFFER_SIZE - 1) ? 0 : block_index;
+    return block_index == (config->_stepping->_segments - 1) ? 0 : block_index;
 }
 
 /* Prepares step segment buffer. Continuously called from main program.
@@ -412,13 +444,13 @@ void Stepper::prep_buffer() {
                     pl_block->entry_speed_sqr           = prep.exit_speed * prep.exit_speed;
                     prep.recalculate_flag.decelOverride = 0;
                 } else {
-                    prep.current_speed = float(sqrt(pl_block->entry_speed_sqr));
+                    prep.current_speed = sqrtf(pl_block->entry_speed_sqr);
                 }
 
                 // prep.inv_rate is only used if is_pwm_rate_adjusted is true
                 st_prep_block->is_pwm_rate_adjusted = false;  // set default value
 
-                if (config->_laserMode) {
+                if (spindle->isRateAdjusted()) {
                     if (pl_block->spindle == SpindleState::Ccw) {
                         // Pre-compute inverse programmed rate to speed up PWM updating per step segment.
                         prep.inv_rate                       = 1.0f / pl_block->programmed_rate;
@@ -442,7 +474,7 @@ void Stepper::prep_buffer() {
                 float decel_dist = pl_block->millimeters - inv_2_accel * pl_block->entry_speed_sqr;
                 if (decel_dist < 0.0) {
                     // Deceleration through entire planner block. End of feed hold is not in this block.
-                    prep.exit_speed = float(sqrt(pl_block->entry_speed_sqr - 2 * pl_block->acceleration * pl_block->millimeters));
+                    prep.exit_speed = sqrtf(pl_block->entry_speed_sqr - 2 * pl_block->acceleration * pl_block->millimeters);
                 } else {
                     prep.mm_complete = decel_dist;  // End of feed hold.
                     prep.exit_speed  = 0.0;
@@ -457,7 +489,7 @@ void Stepper::prep_buffer() {
                     prep.exit_speed = exit_speed_sqr = 0.0;  // Enforce stop at end of system motion.
                 } else {
                     exit_speed_sqr  = plan_get_exec_block_exit_speed_sqr();
-                    prep.exit_speed = float(sqrt(exit_speed_sqr));
+                    prep.exit_speed = sqrtf(exit_speed_sqr);
                 }
 
                 nominal_speed            = plan_compute_profile_nominal_speed(pl_block);
@@ -470,7 +502,7 @@ void Stepper::prep_buffer() {
                         // prep.decelerate_after = pl_block->millimeters;
                         // prep.maximum_speed = prep.current_speed;
                         // Compute override block exit speed since it doesn't match the planner exit speed.
-                        prep.exit_speed = float(sqrt(pl_block->entry_speed_sqr - 2 * pl_block->acceleration * pl_block->millimeters));
+                        prep.exit_speed = sqrtf(pl_block->entry_speed_sqr - 2 * pl_block->acceleration * pl_block->millimeters);
                         prep.recalculate_flag.decelOverride = 1;  // Flag to load next block as deceleration override.
                         // TODO: Determine correct handling of parameters in deceleration-only.
                         // Can be tricky since entry speed will be current speed, as in feed holds.
@@ -497,7 +529,7 @@ void Stepper::prep_buffer() {
                         } else {  // Triangle type
                             prep.accelerate_until = intersect_distance;
                             prep.decelerate_after = intersect_distance;
-                            prep.maximum_speed    = float(sqrt(2.0f * pl_block->acceleration * intersect_distance + exit_speed_sqr));
+                            prep.maximum_speed    = sqrtf(2.0f * pl_block->acceleration * intersect_distance + exit_speed_sqr);
                         }
                     } else {  // Deceleration-only type
                         prep.ramp_type = RAMP_DECEL;
@@ -515,7 +547,7 @@ void Stepper::prep_buffer() {
         }
 
         // Initialize new segment
-        segment_t* prep_segment = &segment_buffer[segment_buffer_head];
+        volatile segment_t* prep_segment = &segment_buffer[segment_buffer_head];
 
         // Set new segment to point to the current segment data block.
         prep_segment->st_block_index = prep.st_block_index;
@@ -644,7 +676,7 @@ void Stepper::prep_buffer() {
 
                 prep.current_spindle_speed = speed;
             } else {
-                sys.spindle_speed          = 0;
+                sys.set_spindle_speed(0);
                 prep.current_spindle_speed = 0;
             }
             sys.step_control.updateSpindleSpeed = false;
@@ -663,8 +695,8 @@ void Stepper::prep_buffer() {
            machines (i.e. exceeding 10 meters axis travel at 200 step/mm).
         */
         float step_dist_remaining    = prep.step_per_mm * mm_remaining;                       // Convert mm_remaining to steps
-        float n_steps_remaining      = float(ceil(step_dist_remaining));                      // Round-up current steps remaining
-        float last_n_steps_remaining = float(ceil(prep.steps_remaining));                     // Round-up last steps remaining
+        float n_steps_remaining      = ceilf(step_dist_remaining);                            // Round-up current steps remaining
+        float last_n_steps_remaining = ceilf(prep.steps_remaining);                           // Round-up last steps remaining
         prep_segment->n_step         = uint16_t(last_n_steps_remaining - n_steps_remaining);  // Compute number of steps to execute.
 
         // Bail if we are at the end of a feed hold and don't have a step to execute.
@@ -696,7 +728,7 @@ void Stepper::prep_buffer() {
         // Compute CPU cycles per step for the prepped segment.
         // fStepperTimer is in units of timerTicks/sec, so the dimensional analysis is
         // timerTicks/sec * 60 sec/minute * minutes = timerTicks
-        uint32_t timerTicks = uint32_t(ceil((Machine::Stepping::fStepperTimer * 60) * inv_rate));  // (timerTicks/step)
+        uint32_t timerTicks = uint32_t(ceilf((Machine::Stepping::fStepperTimer * 60) * inv_rate));  // (timerTicks/step)
         int      level;
 
         // Compute step timing and multi-axis smoothing level.
@@ -713,10 +745,10 @@ void Stepper::prep_buffer() {
         prep_segment->isrPeriod = timerTicks > 0xffff ? 0xffff : timerTicks;
 
         // Segment complete! Increment segment buffer indices, so stepper ISR can immediately execute it.
-        segment_buffer_head = segment_next_head;
-        if (++segment_next_head == SEGMENT_BUFFER_SIZE) {
-            segment_next_head = 0;
-        }
+        auto lastseg        = segment_next_head;
+        segment_next_head   = segment_next_head >= (config->_stepping->_segments - 1) ? 0 : segment_next_head + 1;
+        segment_buffer_head = lastseg;
+
         // Update the appropriate planner and segment data.
         pl_block->millimeters = mm_remaining;
         prep.steps_remaining  = n_steps_remaining;
@@ -751,7 +783,7 @@ void Stepper::prep_buffer() {
 // in the segment buffer. It will always be behind by up to the number of segment blocks (-1)
 // divided by the ACCELERATION TICKS PER SECOND in seconds.
 float Stepper::get_realtime_rate() {
-    switch (sys.state) {
+    switch (sys.state()) {
         case State::Cycle:
         case State::Homing:
         case State::Hold:
@@ -761,8 +793,4 @@ float Stepper::get_realtime_rate() {
         default:
             return 0.0f;
     }
-}
-
-void Stepper::init() {
-    config->_stepping->init();
 }

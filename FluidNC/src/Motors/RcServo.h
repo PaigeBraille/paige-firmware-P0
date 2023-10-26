@@ -5,22 +5,25 @@
 
 #include "Servo.h"
 #include "RcServoSettings.h"
+#include "Driver/PwmPin.h"
 
 namespace MotorDrivers {
     class RcServo : public Servo {
     protected:
+        int _timer_ms = 20;
+
         void config_message() override;
 
         void set_location();
 
         Pin      _output_pin;
         uint32_t _pwm_freq = SERVO_PWM_FREQ_DEFAULT;  // 50 Hz
-        uint8_t  _pwm_chan_num;
+        PwmPin*  _pwm;
         uint32_t _current_pwm_duty;
 
         bool _disabled;
 
-        uint32_t _min_pulse_us = SERVO_PULSE_US_MIN_DEFAULT;   // microseconds
+        uint32_t _min_pulse_us = SERVO_PULSE_US_MIN_DEFAULT;  // microseconds
         uint32_t _max_pulse_us = SERVO_PULSE_US_MAX_DEFAULT;  // microseconds
 
         uint32_t _min_pulse_cnt = 0;  // microseconds
@@ -32,6 +35,11 @@ namespace MotorDrivers {
 
     public:
         RcServo() = default;
+        ~RcServo() {
+            if (_pwm) {
+                delete _pwm;
+            }
+        }
 
         // Overrides for inherited methods
         void init() override;
@@ -42,12 +50,17 @@ namespace MotorDrivers {
 
         void _write_pwm(uint32_t duty);
 
+        const char* name() override { return "rc_servo"; }
+
         // Configuration handlers:
         void group(Configuration::HandlerBase& handler) override {
             handler.item("output_pin", _output_pin);
-            handler.item("pwm_freq", _pwm_freq);
-            handler.item("min_pulse_us", _min_pulse_us);
-            handler.item("max_pulse_us", _max_pulse_us);
+            handler.item("pwm_hz", _pwm_freq, SERVO_PWM_FREQ_MIN, SERVO_PWM_FREQ_MAX);
+            handler.item("min_pulse_us", _min_pulse_us, SERVO_PULSE_US_MIN, SERVO_PULSE_US_MAX);
+            handler.item("max_pulse_us", _max_pulse_us, SERVO_PULSE_US_MIN, SERVO_PULSE_US_MAX);
+            handler.item("timer_ms", _timer_ms);
+
+            Servo::group(handler);
         }
 
         // Name of the configurable. Must match the name registered in the cpp file.

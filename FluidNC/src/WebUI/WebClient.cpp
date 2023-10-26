@@ -7,10 +7,25 @@
 #    include <WebServer.h>
 
 namespace WebUI {
-    WebClient::WebClient(WebServer* webserver, bool silent) : _header_sent(false), _silent(silent), _webserver(webserver), _buflen(0) {}
+    WebClient webClient;
+
+    WebClient::WebClient() : Channel("webclient") {}
+
+    void WebClient::attachWS(WebServer* webserver, bool silent) {
+        _header_sent = false;
+        _silent      = silent;
+        _webserver   = webserver;
+        _buflen      = 0;
+    }
+
+    void WebClient::detachWS() {
+        flush();
+        _webserver->sendContent("");  //close connection
+        _webserver = nullptr;
+    }
 
     size_t WebClient::write(const uint8_t* buffer, size_t length) {
-        if (_silent) {
+        if (!_webserver || _silent) {
             return length;
         }
         if (!_header_sent) {
@@ -21,23 +36,24 @@ namespace WebUI {
             _header_sent = true;
         }
 
-        size_t remaining = length;
-        while (remaining) {
-            size_t copylen = std::min(remaining, BUFLEN - _buflen);
-            memcpy(&_buffer[_buflen], buffer, copylen);
+        size_t index = 0;
+        while (index < length) {
+            size_t copylen = std::min(length - index, BUFLEN - _buflen);
+            memcpy(_buffer + _buflen, buffer + index, copylen);
             _buflen += copylen;
-            remaining -= copylen;
+            index += copylen;
             if (_buflen >= BUFLEN) {  // The > case should not happen
                 flush();
             }
         }
+
         return length;
     }
 
     size_t WebClient::write(uint8_t data) { return write(&data, 1); }
 
     void WebClient::flush() {
-        if (_buflen) {
+        if (_webserver && _buflen) {
             _webserver->sendContent(_buffer, _buflen);
             _buflen = 0;
         }

@@ -6,10 +6,10 @@
   Serial.cpp - Header for system level commands and real-time processes
 
   Original Grbl only supports communication via serial port. That is why this
-  file is call serial.cpp. FluidNC supports many "clients".
+  file is call serial.cpp. FluidNC supports many "channels".
 
-  Clients are sources of commands like the serial port or a bluetooth connection.
-  Multiple clients can be active at a time. If a client asks for status, only the client will
+  Channels are sources of commands like the serial port or a bluetooth connection.
+  Multiple channels can be active at a time. If a channel asks for status, only the channel will
   receive the reply to the command.
 
   The serial port acts as the debugging port because it is always on and does not
@@ -17,10 +17,10 @@
   are sent to the serial port automatically, without a request command. These are in the
   [MSG: xxxxxx] format which is part of the Grbl protocol.
 
-  Important: It is up to the user that the clients play well together. Ideally, if one client
+  Important: It is up to the user that the channels play well together. Ideally, if one channel
   is sending the gcode, the others should just be doing status, feedhold, etc.
 
-  Clients send line-oriented command (GCode, $$, [ESP...], etc) and realtime commands (?,!.~, etc)
+  Channels send line-oriented command (GCode, $$, [ESP...], etc) and realtime commands (?,!.~, etc)
   A line-oriented command is a string of printable characters followed by a '\r' or '\n'
   A realtime commands is a single character with no '\r' or '\n'
 
@@ -32,34 +32,37 @@
   Realtime commands can be anywhere in the stream.
 
   To allow the realtime commands to be randomly mixed in the stream of data, we
-  read all clients as fast as possible. The realtime commands are acted upon and
-  the other characters are placed into a per-client buffer.  When a complete line
-  is received, pollClient returns the associated client spec.
+  read all channels as fast as possible. The realtime commands are acted upon and
+  the other characters are placed into a per-channel buffer.  When a complete line
+  is received, pollChannel returns the associated channel spec.
 */
 
 #include "Serial.h"
-#include "Uart.h"
+#include "UartChannel.h"
 #include "Machine/MachineConfig.h"
 #include "WebUI/InputBuffer.h"
-#include "WebUI/TelnetServer.h"
-#include "WebUI/Serial2Socket.h"
 #include "WebUI/Commands.h"
 #include "WebUI/WifiServices.h"
 #include "MotionControl.h"
 #include "Report.h"
 #include "System.h"
-#include "Protocol.h"  // rtSafetyDoor etc
-#include "SDCard.h"
+#include "Protocol.h"  // *Event
+#include "InputFile.h"
 #include "WebUI/InputBuffer.h"  // XXX could this be a StringStream ?
+#include "Main.h"               // display()
+#include "StartupLog.h"         // startupLog
+
+#include "Driver/fluidnc_gpio.h"
 
 #include <atomic>
 #include <cstring>
 #include <vector>
+#include <algorithm>
 #include <freertos/task.h>  // portMUX_TYPE, TaskHandle_T
 
-portMUX_TYPE myMutex = portMUX_INITIALIZER_UNLOCKED;
+std::mutex AllChannels::_mutex;
 
-static TaskHandle_t clientCheckTaskHandle = 0;
+static TaskHandle_t channelCheckTaskHandle = 0;
 
 void heapCheckTask(void* pvParameters) {
     static uint32_t heapSize = 0;
@@ -80,108 +83,95 @@ void heapCheckTask(void* pvParameters) {
 }
 
 // Act upon a realtime character
-static void execute_realtime_command(Cmd command, Print& client) {
+void execute_realtime_command(Cmd command, Channel& channel) {
     switch (command) {
         case Cmd::Reset:
             log_debug("Cmd::Reset");
-            mc_reset();  // Call motion control reset routine.
+            protocol_send_event(&resetEvent);
             break;
         case Cmd::StatusReport:
-            report_realtime_status(client);  // direct call instead of setting flag
+            report_realtime_status(channel);  // direct call instead of setting flag
+            // protocol_send_event(&reportStatusEvent, int(&channel));
             break;
         case Cmd::CycleStart:
-            rtCycleStart = true;
+            protocol_send_event(&cycleStartEvent);
             break;
         case Cmd::FeedHold:
-            rtFeedHold = true;
+            protocol_send_event(&feedHoldEvent);
             break;
         case Cmd::SafetyDoor:
-            rtSafetyDoor = true;
+            protocol_send_event(&safetyDoorEvent);
             break;
         case Cmd::JogCancel:
-            if (sys.state == State::Jog) {  // Block all other states from invoking motion cancel.
-                rtMotionCancel = true;
+            if (sys.state() == State::Jog) {  // Block all other states from invoking motion cancel.
+                protocol_send_event(&motionCancelEvent);
             }
             break;
         case Cmd::DebugReport:
-#ifdef DEBUG_REPORT_REALTIME
-            rtExecDebug = true;
-#endif
+            protocol_send_event(&debugEvent);
             break;
         case Cmd::SpindleOvrStop:
-            rtAccessoryOverride.bit.spindleOvrStop = 1;
+            protocol_send_event(&accessoryOverrideEvent, AccessoryOverride::SpindleStopOvr);
             break;
         case Cmd::FeedOvrReset:
-            rtFOverride = FeedOverride::Default;
+            protocol_send_event(&feedOverrideEvent, FeedOverride::Default);
             break;
         case Cmd::FeedOvrCoarsePlus:
-            rtFOverride += FeedOverride::CoarseIncrement;
-            if (rtFOverride > FeedOverride::Max) {
-                rtFOverride = FeedOverride::Max;
-            }
+            protocol_send_event(&feedOverrideEvent, FeedOverride::CoarseIncrement);
             break;
         case Cmd::FeedOvrCoarseMinus:
-            rtFOverride -= FeedOverride::CoarseIncrement;
-            if (rtFOverride < FeedOverride::Min) {
-                rtFOverride = FeedOverride::Min;
-            }
+            protocol_send_event(&feedOverrideEvent, -FeedOverride::CoarseIncrement);
             break;
         case Cmd::FeedOvrFinePlus:
-            rtFOverride += FeedOverride::FineIncrement;
-            if (rtFOverride > FeedOverride::Max) {
-                rtFOverride = FeedOverride::Max;
-            }
+            protocol_send_event(&feedOverrideEvent, FeedOverride::FineIncrement);
             break;
         case Cmd::FeedOvrFineMinus:
-            rtFOverride -= FeedOverride::FineIncrement;
-            if (rtFOverride < FeedOverride::Min) {
-                rtFOverride = FeedOverride::Min;
-            }
+            protocol_send_event(&feedOverrideEvent, -FeedOverride::FineIncrement);
             break;
         case Cmd::RapidOvrReset:
-            rtROverride = RapidOverride::Default;
+            protocol_send_event(&rapidOverrideEvent, RapidOverride::Default);
             break;
         case Cmd::RapidOvrMedium:
-            rtROverride = RapidOverride::Medium;
+            protocol_send_event(&rapidOverrideEvent, RapidOverride::Medium);
             break;
         case Cmd::RapidOvrLow:
-            rtROverride = RapidOverride::Low;
+            protocol_send_event(&rapidOverrideEvent, RapidOverride::Low);
             break;
         case Cmd::RapidOvrExtraLow:
-            rtROverride = RapidOverride::ExtraLow;
+            protocol_send_event(&rapidOverrideEvent, RapidOverride::ExtraLow);
             break;
         case Cmd::SpindleOvrReset:
-            rtSOverride = SpindleSpeedOverride::Default;
+            protocol_send_event(&spindleOverrideEvent, SpindleSpeedOverride::Default);
             break;
         case Cmd::SpindleOvrCoarsePlus:
-            rtSOverride += SpindleSpeedOverride::CoarseIncrement;
-            if (rtSOverride > SpindleSpeedOverride::Max) {
-                rtSOverride = SpindleSpeedOverride::Max;
-            }
+            protocol_send_event(&spindleOverrideEvent, SpindleSpeedOverride::CoarseIncrement);
             break;
         case Cmd::SpindleOvrCoarseMinus:
-            rtSOverride -= SpindleSpeedOverride::CoarseIncrement;
-            if (rtSOverride < SpindleSpeedOverride::Min) {
-                rtSOverride = SpindleSpeedOverride::Min;
-            }
+            protocol_send_event(&spindleOverrideEvent, -SpindleSpeedOverride::CoarseIncrement);
             break;
         case Cmd::SpindleOvrFinePlus:
-            rtSOverride += SpindleSpeedOverride::FineIncrement;
-            if (rtSOverride > SpindleSpeedOverride::Max) {
-                rtSOverride = SpindleSpeedOverride::Max;
-            }
+            protocol_send_event(&spindleOverrideEvent, SpindleSpeedOverride::FineIncrement);
             break;
         case Cmd::SpindleOvrFineMinus:
-            rtSOverride -= SpindleSpeedOverride::FineIncrement;
-            if (rtSOverride < SpindleSpeedOverride::Min) {
-                rtSOverride = SpindleSpeedOverride::Min;
-            }
+            protocol_send_event(&spindleOverrideEvent, -SpindleSpeedOverride::FineIncrement);
             break;
         case Cmd::CoolantFloodOvrToggle:
-            rtAccessoryOverride.bit.coolantFloodOvrToggle = 1;
+            protocol_send_event(&accessoryOverrideEvent, AccessoryOverride::FloodToggle);
             break;
         case Cmd::CoolantMistOvrToggle:
-            rtAccessoryOverride.bit.coolantMistOvrToggle = 1;
+            protocol_send_event(&accessoryOverrideEvent, AccessoryOverride::MistToggle);
+            break;
+        case Cmd::Macro0:
+            protocol_send_event(&macro0Event);
+            break;
+        case Cmd::Macro1:
+            protocol_send_event(&macro1Event);
+            break;
+        case Cmd::Macro2:
+            protocol_send_event(&macro2Event);
+            break;
+        case Cmd::Macro3:
+            protocol_send_event(&macro3Event);
             break;
     }
 }
@@ -195,109 +185,136 @@ bool is_realtime_command(uint8_t data) {
     return cmd == Cmd::Reset || cmd == Cmd::StatusReport || cmd == Cmd::CycleStart || cmd == Cmd::FeedHold;
 }
 
-InputClient* sdClient = new InputClient(nullptr);
-
-std::vector<InputClient*> clientq;
-
-void register_client(Stream* client_stream) {
-    clientq.push_back(new InputClient(client_stream));
-}
-void client_init() {
-    register_client(&Uart0);               // USB Serial
-    register_client(&WebUI::inputBuffer);  // Macros
-#ifdef ENABLE_WIFI
-    register_client(&WebUI::Serial2Socket);
-    register_client(&WebUI::telnet_server);
-#endif
-#ifdef ENABLE_BT
-    register_client(&WebUI::SerialBT);
-#endif
+void AllChannels::init() {
+    registration(&WebUI::inputBuffer);  // Macros
+    registration(&startupLog);          // Early startup messages for $SS
 }
 
-InputClient* pollClients() {
-    auto sdcard = config->_sdCard;
-    // _readyNext indicates that input is coming from a file and
-    // the GCode system is ready for another line.
-    if (sdcard && sdcard->_readyNext) {
-        Error res = sdcard->readFileLine(sdClient->_line, InputClient::maxLine);
-        if (res == Error::Ok) {
-            sdClient->_out     = &sdcard->getClient();
-            sdcard->_readyNext = false;
-            return sdClient;
-        }
-        report_status_message(res, sdcard->getClient());
-    }
-
-    for (auto client : clientq) {
-        auto source = client->_in;
-        int  c      = source->read();
-
-        if (c >= 0) {
-            char ch = c;
-            if (client->_line_returned) {
-                client->_line_returned = false;
-                client->_linelen       = 0;
-            }
-            if (is_realtime_command(c)) {
-                execute_realtime_command(static_cast<Cmd>(c), *source);
-                continue;
-            }
-
-            if (ch == '\b') {
-                // Simple editing for interactive input - backspace erases
-                if (client->_linelen) {
-                    --client->_linelen;
-                }
-                continue;
-            }
-            if ((client->_linelen + 1) == InputClient::maxLine) {
-                report_status_message(Error::Overflow, *source);
-                // XXX could show a message with the overflow line
-                // XXX There is a problem here - the final fragment of the
-                // too-long line will be returned as a valid line.  We really
-                // need to enter a state where we ignore characters until
-                // the newline.
-                client->_linelen = 0;
-                continue;
-            }
-            if (ch == '\r' || ch == '\n') {
-                client->_line_num++;
-                if (config->_sdCard->get_state() < SDCard::State::Busy) {
-                    client->_line[client->_linelen] = '\0';
-                    client->_line_returned          = true;
-                    return client;
-                } else {
-                    // Log an error and discard the line if it happens during an SD run
-                    log_error("SD card job running");
-                    client->_linelen = 0;
-                    continue;
-                }
-            }
-
-            client->_line[client->_linelen] = ch;
-            ++client->_linelen;
-        }
-    }
-
-    WebUI::COMMANDS::handle();  // Handles feeding watchdog and ESP restart
-#ifdef ENABLE_WIFI
-    WebUI::wifi_services.handle();  // OTA, web_server, telnet_server polling
-#endif
-
-    return nullptr;
+void AllChannels::kill(Channel* channel) {
+    xQueueSend(_killQueue, &channel, 0);
 }
 
-size_t AllClients::write(uint8_t data) {
-    for (auto client : clientq) {
-        client->_out->write(data);
+void AllChannels::registration(Channel* channel) {
+    _mutex.lock();
+    _channelq.push_back(channel);
+    _mutex.unlock();
+}
+void AllChannels::deregistration(Channel* channel) {
+    _mutex.lock();
+    if (channel == _lastChannel) {
+        _lastChannel = nullptr;
     }
+    _channelq.erase(std::remove(_channelq.begin(), _channelq.end(), channel), _channelq.end());
+    _mutex.unlock();
+}
+
+void AllChannels::listChannels(Channel& out) {
+    _mutex.lock();
+    std::string retval;
+    for (auto channel : _channelq) {
+        log_to(out, channel->name());
+    }
+    _mutex.unlock();
+}
+
+void AllChannels::flushRx() {
+    _mutex.lock();
+    for (auto channel : _channelq) {
+        channel->flushRx();
+    }
+    _mutex.unlock();
+}
+
+size_t AllChannels::write(uint8_t data) {
+    _mutex.lock();
+    for (auto channel : _channelq) {
+        channel->write(data);
+    }
+    _mutex.unlock();
     return 1;
 }
-size_t AllClients::write(const uint8_t* buffer, size_t length) {
-    for (auto client : clientq) {
-        client->_out->write(buffer, length);
+void AllChannels::notifyWco(void) {
+    _mutex.lock();
+    for (auto channel : _channelq) {
+        channel->notifyWco();
     }
-    return length;
+    _mutex.unlock();
+}
+void AllChannels::notifyNgc(CoordIndex coord) {
+    _mutex.lock();
+    for (auto channel : _channelq) {
+        channel->notifyNgc(coord);
+    }
+    _mutex.unlock();
 }
 
-AllClients allClients;
+void AllChannels::stopJob() {
+    _mutex.lock();
+    for (auto channel : _channelq) {
+        channel->stopJob();
+    }
+    _mutex.unlock();
+}
+
+size_t AllChannels::write(const uint8_t* buffer, size_t length) {
+    _mutex.lock();
+    for (auto channel : _channelq) {
+        channel->write(buffer, length);
+    }
+    _mutex.unlock();
+    return length;
+}
+Channel* AllChannels::pollLine(char* line) {
+    Channel* deadChannel;
+    while (xQueueReceive(_killQueue, &deadChannel, 0)) {
+        deregistration(deadChannel);
+        delete deadChannel;
+    }
+
+    // To avoid starving other channels when one has a lot
+    // of traffic, we poll the other channels before the last
+    // one that returned a line.
+    _mutex.lock();
+
+    for (auto channel : _channelq) {
+        // Skip the last channel in the loop
+        if (channel != _lastChannel && channel->pollLine(line)) {
+            _lastChannel = channel;
+            _mutex.unlock();
+            return _lastChannel;
+        }
+    }
+    _mutex.unlock();
+    // If no other channel returned a line, try the last one
+    if (_lastChannel && _lastChannel->pollLine(line)) {
+        return _lastChannel;
+    }
+    _lastChannel = nullptr;
+    return _lastChannel;
+}
+
+AllChannels allChannels;
+
+Channel* pollChannels(char* line) {
+    poll_gpios();
+    // Throttle polling when we are not ready for a line, thus preventing
+    // planner buffer starvation due to not calling Stepper::prep_buffer()
+    // frequently enough, which is normally called periodically at the end
+    // of protocol_exec_rt_system() via protocol_execute_realtime().
+    static int counter = 0;
+    if (line) {
+        counter = 0;
+    }
+    if (counter > 0) {
+        --counter;
+        return nullptr;
+    }
+    counter = 50;
+
+    Channel* retval = allChannels.pollLine(line);
+
+    WebUI::COMMANDS::handle();      // Handles ESP restart
+    WebUI::wifi_services.handle();  // OTA, webServer, telnetServer polling
+
+    return retval;
+}

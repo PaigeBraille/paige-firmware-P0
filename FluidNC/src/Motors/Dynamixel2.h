@@ -22,31 +22,44 @@ namespace MotorDrivers {
         void set_location();
 
         uint8_t _id;
-        char    _dxl_tx_message[50];  // outgoing to dynamixel
-        uint8_t _dxl_rx_message[50];  // received from dynamixel
+
+        static int _timer_ms;
+
+        static uint8_t _tx_message[100];  // outgoing to dynamixel
+        static uint8_t _msg_index;
+        static uint8_t _rx_message[50];  // received from dynamixel
+
+        static void start_message(uint8_t id, uint8_t instr);
+        static void finish_message();
+        static void add_uint8(uint8_t n);
+        static void add_uint16(uint16_t n);
+        static void add_uint32(uint32_t n);
+
+        void start_write(uint16_t address);
+        void finish_write();
+        void show_status();
 
         bool     test();
-        uint16_t dxl_get_response(uint16_t length);
         uint32_t dxl_read_position();
         void     dxl_read(uint16_t address, uint16_t data_len);
-        void     dxl_write(uint16_t address, uint8_t paramCount, ...);
-        void     dxl_goal_position(int32_t position);  // set one motor
-        void     set_operating_mode(uint8_t mode);
-        void     LED_on(bool on);
 
-        static void     dxl_finish_message(uint8_t id, char* msg, uint16_t msg_len);
-        static uint16_t dxl_update_crc(uint16_t crc_accum, char* data_blk_ptr, uint8_t data_blk_size);
-        void            dxl_bulk_goal_position();
+        void dxl_goal_position(int32_t position);  // set one motor
+        void set_operating_mode(uint8_t mode);
+        void LED_on(bool on);
 
-        float _homing_position;
+        size_t dxl_get_response(uint16_t length);
 
-        float _dxl_count_min;
-        float _dxl_count_max;
+        static uint16_t dxl_update_crc(uint16_t crc_accum, uint8_t* data_blk_ptr, uint8_t data_blk_size);
 
-        int  _axis_index;
-        bool _invert_direction = false;
+        static TimerHandle_t _timer;
 
-        Uart* _uart = nullptr;
+        static std::vector<Dynamixel2*> _instances;
+
+        int _axis_index;
+
+        static Uart* _uart;
+
+        int _uart_num = -1;
 
         static bool _uart_started;
 
@@ -67,6 +80,7 @@ namespace MotorDrivers {
 
         // protocol 2 instruction numbers
         static const int  DXL_INSTR_PING = 0x01;
+        static const char DXL_REBOOT     = char(0x08);
         static const int  PING_RSP_LEN   = 14;
         static const char DXL_READ       = char(0x02);
         static const char DXL_WRITE      = char(0x03);
@@ -85,40 +99,37 @@ namespace MotorDrivers {
         uint32_t _countMin = 1024;
         uint32_t _countMax = 3072;
 
-        bool _disabled;
-        bool _has_errors;
+        bool        _disabled;
+        static bool _has_errors;
 
     public:
-        Dynamixel2() : _id(255), _disabled(true), _has_errors(true) {}
-
-        String idString() { return "Dynamixel Servo ID " + _id; }
+        Dynamixel2() : _id(255), _disabled(true) {}
 
         // Overrides for inherited methods
-        void init() override;
-        void read_settings() override;
-        bool set_homing_mode(bool isHoming) override;
-        void set_disable(bool disable) override;
-        void update() override;
+        void        init() override;
+        void        read_settings() override;
+        bool        set_homing_mode(bool isHoming) override;
+        void        set_disable(bool disable) override;
+        void        update() override;
+        static void update_all();
+        void        config_motor() override;
 
-        static uint8_t ids[MAX_N_AXIS][2];
+        const char* name() override { return "dynamixel2"; }
 
         // Configuration handlers:
-        void validate() const override {
-            Assert(_uart != nullptr, "Dynamixel: Missing UART configuration");
-            Assert(!_uart->_rts_pin.undefined(), "Dynamixel: UART RTS pin must be configured.");
+        void validate() override {
+            Assert(_uart_num != -1, "Dynamixel: Missing uart_num configuration");
             Assert(_id != 255, "Dynamixel: ID must be configured.");
         }
 
         void group(Configuration::HandlerBase& handler) override {
-            handler.item("invert_direction", _invert_direction);
-
+            handler.item("uart_num", _uart_num);
+            handler.item("id", _id);
             handler.item("count_min", _countMin);
             handler.item("count_max", _countMax);
-            handler.section("uart", _uart);
+            handler.item("timer_ms", _timer_ms);
 
-            int id = _id;
-            handler.item("id", id);
-            _id = id;
+            Servo::group(handler);
         }
 
         // Name of the configurable. Must match the name registered in the cpp file.

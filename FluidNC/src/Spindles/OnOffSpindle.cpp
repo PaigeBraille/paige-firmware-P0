@@ -33,7 +33,7 @@ namespace Spindles {
     }
 
     void OnOff::setState(SpindleState state, SpindleSpeed speed) {
-        if (sys.abort) {
+        if (sys.abort()) {
             return;  // Block during abort.
         }
 
@@ -58,8 +58,8 @@ namespace Spindles {
 
     void IRAM_ATTR OnOff::setSpeedfromISR(uint32_t dev_speed) { set_output(dev_speed != 0); }
 
-    void OnOff::set_enable(bool enable) {
-        if (_disable_with_zero_speed && sys.spindle_speed == 0) {
+    void IRAM_ATTR OnOff::set_enable(bool enable) {
+        if (_disable_with_zero_speed && sys.spindle_speed() == 0) {
             enable = false;
         }
 
@@ -68,7 +68,6 @@ namespace Spindles {
 
     void OnOff::set_direction(bool Clockwise) { _direction_pin.synchronousWrite(Clockwise); }
 
-    // 0=0% 0=100%
     void OnOff::deinit() {
         stop();
         _enable_pin.setAttr(Pin::Attr::Input);

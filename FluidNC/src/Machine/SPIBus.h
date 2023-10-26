@@ -11,17 +11,22 @@ namespace Machine {
     public:
         SPIBus() = default;
 
-        Pin _cs;
         Pin _miso;
         Pin _mosi;
         Pin _sck;
 
-        void validate() const override;
+        void validate() override;
         void group(Configuration::HandlerBase& handler) override;
         void afterParse() override;
 
         void init();
+        void deinit();
+
+        bool defined();
 
         ~SPIBus() = default;
+
+    private:
+        bool _defined = false;
     };
 }

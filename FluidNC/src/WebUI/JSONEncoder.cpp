@@ -2,24 +2,22 @@
 
 #include "JSONEncoder.h"
 #include "../Report.h"
+#include "../Protocol.h"  // send_line()
 
 namespace WebUI {
     // Constructor.  If _pretty is true, newlines are
     // inserted into the JSON string for easy reading.
-    JSONencoder::JSONencoder(bool pretty, Print* s) : pretty(pretty), level(0), str(""), stream(s) { count[level] = 0; }
+    JSONencoder::JSONencoder(bool pretty, Channel* channel) : pretty(pretty), level(0), _channel(channel), category("nvs") {
+        count[level] = 0;
+    }
 
-    // Constructor.  If _pretty is true, newlines are
-    // inserted into the JSON string for easy reading.
-    JSONencoder::JSONencoder(bool pretty) : JSONencoder(pretty, nullptr) {}
-
-    // Constructor that supplies a default falue for "pretty"
-    JSONencoder::JSONencoder() : JSONencoder(false) {}
+    JSONencoder::JSONencoder(bool pretty, std::string* str) : pretty(pretty), level(0), _str(str), category("nvs") { count[level] = 0; }
 
     void JSONencoder::add(char c) {
-        if (stream) {
-            (*stream) << c;
+        if (_str) {
+            (*_str) += c;
         } else {
-            str += c;
+            linebuf += c;
         }
     }
 
@@ -49,10 +47,41 @@ namespace WebUI {
     // Private function to add a name enclosed with quotes.
     void JSONencoder::quoted(const char* s) {
         add('"');
-        if (stream) {
-            (*stream) << s;
-        } else {
-            str.concat(s);
+        char c;
+        while ((c = *s++) != '\0') {
+            // Escape JSON special characters
+            switch (c) {
+                case '\b':
+                    add('\\');
+                    add('b');
+                    break;
+                case '\n':
+                    add('\\');
+                    add('n');
+                    break;
+                case '\f':
+                    add('\\');
+                    add('f');
+                    break;
+                case '\r':
+                    add('\\');
+                    add('r');
+                    break;
+                case '\t':
+                    add('\\');
+                    add('t');
+                    break;
+                case '"':
+                    add('\\');
+                    add('\"');
+                    break;
+                case '\\':
+                    add('\\');
+                    // Fall through
+                default:
+                    add(c);
+                    break;
+            }
         }
         add('"');
     }
@@ -73,8 +102,19 @@ namespace WebUI {
 
     // Private function to implement pretty-printing
     void JSONencoder::line() {
-        if (pretty) {
-            add('\n');
+        if (_str) {
+            if (pretty) {
+                add('\n');
+                linebuf = "";
+                for (int i = 0; i < 2 * level; i++) {
+                    add(' ');
+                }
+            }
+        } else {
+            // Always pretty print to a channel, because channels
+            // cannot necessary handle really long lines.
+            log_to(*_channel, linebuf);
+            linebuf = "";
             for (int i = 0; i < 2 * level; i++) {
                 add(' ');
             }
@@ -86,12 +126,9 @@ namespace WebUI {
 
     // Finishes the JSON encoding process, closing the unnamed object
     // and returning the encoded string
-    String JSONencoder::end() {
+    void JSONencoder::end() {
         end_object();
-        if (pretty) {
-            add('\n');
-        }
-        return str;
+        line();
     }
 
     // Starts a member element.
@@ -137,24 +174,27 @@ namespace WebUI {
         quoted(value);
     }
 
-    // Creates a "tag":"value" member from an Arduino string
-    void JSONencoder::member(const char* tag, String value) {
+    // Creates a "tag":"value" member from a C++ string
+    void JSONencoder::member(const char* tag, const std::string& value) {
         begin_member(tag);
         quoted(value.c_str());
     }
 
     // Creates a "tag":"value" member from an integer
-    void JSONencoder::member(const char* tag, int value) { member(tag, String(value)); }
+    void JSONencoder::member(const char* tag, int value) { member(tag, std::to_string(value)); }
 
     // Creates an Esp32_WebUI configuration item specification from
     // a value passed in as a C-style string.
-    void JSONencoder::begin_webui(const char* brief, const char* full, const char* type, const char* val) {
+    void JSONencoder::begin_webui(const char* name, const char* help, const char* type, const char* val) {
         begin_object();
-        member("F", "network");
-        // We must pass the full path as the P parameter because that is
-        // what WebUI sends back to us when setting a new value.
-        member("P", full);
-        member("H", full);
+        member("F", category);
+        // P is the name that WebUI uses to set a new value.
+        // H is the legend that WebUI displays in the UI.
+        // The distinction used to be important because, prior to the introuction
+        // of named settings, P was a numerical offset into a fixed EEPROM layout.
+        // Now P is a hierarchical name that is as easy to understand as the old H values.
+        member("P", name);
+        member("H", help);
         member("T", type);
         member("V", val);
     }
@@ -162,7 +202,7 @@ namespace WebUI {
     // Creates an Esp32_WebUI configuration item specification from
     // an integer value.
     void JSONencoder::begin_webui(const char* brief, const char* full, const char* type, int val) {
-        begin_webui(brief, full, type, String(val).c_str());
+        begin_webui(brief, full, type, std::to_string(val).c_str());
     }
 
     // Creates an Esp32_WebUI configuration item specification from

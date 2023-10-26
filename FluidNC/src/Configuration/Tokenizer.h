@@ -4,7 +4,7 @@
 #pragma once
 
 #include "TokenState.h"
-#include "../Logging.h"
+#include "../Config.h"
 
 namespace Configuration {
 
@@ -61,6 +61,7 @@ namespace Configuration {
 
     public:
         const char* start_;
+        int         line_;
 
         // Results:
         struct TokenData {

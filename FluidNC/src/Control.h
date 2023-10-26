@@ -5,22 +5,14 @@
 
 #include "Configuration/Configurable.h"
 #include "ControlPin.h"
+#include <vector>
 
+using namespace Machine;
 class Control : public Configuration::Configurable {
-private:
-    // TODO: Should we not just put this in an array so we can enumerate it easily?
-
-    ControlPin _safetyDoor;
-    ControlPin _reset;
-    ControlPin _feedHold;
-    ControlPin _cycleStart;
-    ControlPin _macro0;
-    ControlPin _macro1;
-    ControlPin _macro2;
-    ControlPin _macro3;
-
 public:
     Control();
+
+    std::vector<ControlPin*> _pins;
 
     // Initializes control pins.
     void init();
@@ -28,8 +20,12 @@ public:
     // Configuration handlers.
     void group(Configuration::HandlerBase& handler) override;
 
-    bool system_check_safety_door_ajar();
-    void report(char* status);
+    bool stuck();
+    bool safety_door_ajar();
+
+    std::string report_status();
+
+    bool startup_check();
 
     ~Control() = default;
 };

@@ -3,13 +3,14 @@
 // Copyright (c) 2018 -	Bart Dring
 // Use of this source code is governed by a GPLv3 license that can be found in the LICENSE file.
 
-#include "NutsBolts.h"
-
 #include "Machine/MachineConfig.h"
 #include "Protocol.h"  // protocol_exec_rt_system
 
 #include <cstring>
 #include <cstdint>
+#include <cmath>
+#include <sstream>
+#include <iomanip>
 
 const int MAX_INT_DIGITS = 8;  // Maximum number of digits in int32 (and float)
 
@@ -94,52 +95,62 @@ bool read_float(const char* line, size_t* char_counter, float* float_ptr) {
 }
 
 void delay_ms(uint16_t ms) {
-    delay(ms);
+    vTaskDelay(ms / portTICK_PERIOD_MS);
 }
 
 // Non-blocking delay function used for general operation and suspend features.
-bool delay_msec(int32_t milliseconds, DwellMode mode) {
-    // Note: i must be signed, because of the 'i-- > 0' check below.
-    int32_t i         = milliseconds / DWELL_TIME_STEP;
-    int32_t remainder = i < 0 ? 0 : (milliseconds - DWELL_TIME_STEP * i);
-
-    while (i-- > 0) {
-        if (sys.abort) {
-            return false;
-        }
+bool delay_msec(uint32_t milliseconds, DwellMode mode) {
+    while (milliseconds--) {
         if (mode == DwellMode::Dwell) {
             protocol_execute_realtime();
         } else {  // DwellMode::SysSuspend
             // Execute rt_system() only to avoid nesting suspend loops.
             protocol_exec_rt_system();
-            if (sys.suspend.bit.restartRetract) {
+            if (sys.suspend().bit.restartRetract) {
                 return false;  // Bail, if safety door reopens.
             }
         }
-        delay(DWELL_TIME_STEP);  // Delay DWELL_TIME_STEP increment
+        if (sys.abort()) {
+            return false;
+        }
+        vTaskDelay(1 / portTICK_PERIOD_MS);
     }
-    delay(remainder);
     return true;
 }
 
-// Simple hypotenuse computation function.
+// Hypotenuse of a triangle
 float hypot_f(float x, float y) {
-    return float(sqrt(x * x + y * y));
+    return sqrtf(x * x + y * y);
 }
 
-float convert_delta_vector_to_unit_vector(float* vector) {
-    float magnitude = 0.0;
+float vector_distance(float* v1, float* v2, size_t n) {
+    float sum = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        float d = v2[i] - v1[i];
+        sum += d * d;
+    }
+    return sqrtf(sum);
+}
+
+float vector_length(float* v, size_t n) {
+    float sum = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        float d = v[i];
+        sum += d * d;
+    }
+    return sqrtf(sum);
+}
+
+void scale_vector(float* v, float scale, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        v[i] *= scale;
+    }
+}
+
+float convert_delta_vector_to_unit_vector(float* v) {
     auto  n_axis    = config->_axes->_numberAxis;
-    for (size_t idx = 0; idx < n_axis; idx++) {
-        if (vector[idx] != 0.0) {
-            magnitude += vector[idx] * vector[idx];
-        }
-    }
-    magnitude           = float(sqrt(magnitude));
-    float inv_magnitude = 1.0f / magnitude;
-    for (size_t idx = 0; idx < n_axis; idx++) {
-        vector[idx] *= inv_magnitude;
-    }
+    float magnitude = vector_length(v, n_axis);
+    scale_vector(v, 1.0f / magnitude, n_axis);
     return magnitude;
 }
 
@@ -151,7 +162,7 @@ float limit_acceleration_by_axis_maximum(float* unit_vec) {
     for (size_t idx = 0; idx < n_axis; idx++) {
         auto axisSetting = config->_axes->_axis[idx];
         if (unit_vec[idx] != 0) {  // Avoid divide by zero.
-            limit_value = MIN(limit_value, float(fabs(axisSetting->_acceleration / unit_vec[idx])));
+            limit_value = MIN(limit_value, fabsf(axisSetting->_acceleration / unit_vec[idx]));
         }
     }
     // The acceleration setting is stored and displayed in units of mm/sec^2,
@@ -167,7 +178,7 @@ float limit_rate_by_axis_maximum(float* unit_vec) {
     for (size_t idx = 0; idx < n_axis; idx++) {
         auto axisSetting = config->_axes->_axis[idx];
         if (unit_vec[idx] != 0) {  // Avoid divide by zero.
-            limit_value = MIN(limit_value, float(fabs(axisSetting->_maxRate / unit_vec[idx])));
+            limit_value = MIN(limit_value, fabsf(axisSetting->_maxRate / unit_vec[idx]));
         }
     }
     return limit_value;
@@ -196,14 +207,65 @@ char* trim(char* str) {
     return str;
 }
 
-String formatBytes(uint64_t bytes) {
+bool multiple_bits_set(uint32_t val) {
+    // Takes advantage of a quirk of twos-complement math.  If a number has
+    // only one bit set, for example 0b1000, then subtracting 1 will clear that
+    // bit and set only other bits giving e.g. 0b0111, and anding the two gives 0.
+    // If multiple bits are set, subtracting 1 will not clear the high bit.
+    return val & (val - 1);
+}
+
+const char* to_hex(uint32_t n) {
+    static char hexstr[12];
+    snprintf(hexstr, 11, "0x%x", n);
+    return hexstr;
+}
+
+std::string formatBytes(uint64_t bytes) {
     if (bytes < 1024) {
-        return String((uint16_t)bytes) + " B";
-    } else if (bytes < (1024 * 1024)) {
-        return String((float)(bytes / 1024.0), 2) + " KB";
-    } else if (bytes < (1024 * 1024 * 1024)) {
-        return String((float)(bytes / 1024.0 / 1024.0), 2) + " MB";
-    } else {
-        return String((float)(bytes / 1024.0 / 1024.0 / 1024.0), 2) + " GB";
+        return std::to_string((uint16_t)bytes) + " B";
+    }
+    float b = bytes;
+    b /= 1024;
+    if (b < 1024) {
+        std::ostringstream msg;
+        msg << std::fixed << std::setprecision(2) << b << " KB";
+        return msg.str();
+    }
+    b /= 1024;
+    if (b < 1024) {
+        std::ostringstream msg;
+        msg << std::fixed << std::setprecision(2) << b << " MB";
+        return msg.str();
+    }
+    b /= 1024;
+    if (b < 1024) {
+        std::ostringstream msg;
+        msg << std::fixed << std::setprecision(2) << b << " GB";
+        return msg.str();
+    }
+    b /= 1024;
+    if (b > 99999) {
+        b = 99999;
+    }
+    std::ostringstream msg;
+    msg << std::fixed << std::setprecision(2) << b << " TB";
+    return msg.str();
+}
+
+std::string IP_string(uint32_t ipaddr) {
+    std::string retval;
+    retval += std::to_string(uint8_t((ipaddr >> 00) & 0xff)) + ".";
+    retval += std::to_string(uint8_t((ipaddr >> 8) & 0xff)) + ".";
+    retval += std::to_string(uint8_t((ipaddr >> 16) & 0xff)) + ".";
+    retval += std::to_string(uint8_t((ipaddr >> 24) & 0xff));
+    return retval;
+}
+
+void replace_string_in_place(std::string& subject, const std::string& search, const std::string& replace) {
+    size_t pos = 0;
+    while ((pos = subject.find(search, pos)) != std::string::npos) {
+        subject.replace(pos, search.length(), replace);
+        pos += replace.length();
     }
 }

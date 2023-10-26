@@ -6,7 +6,7 @@
 #include "ParseException.h"
 #include "../EnumItem.h"
 
-#include "../Logging.h"
+#include "../Config.h"
 
 #include <climits>
 #include <math.h>  // round
@@ -17,7 +17,7 @@ namespace Configuration {
     void Parser::parseError(const char* description) const {
         // Attempt to use the correct position in the parser:
         if (token_.keyEnd_) {
-            throw ParseException(token_.keyStart_, token_.keyEnd_, description);
+            throw ParseException(line_, description);
         } else {
             Tokenizer::ParseError(description);
         }
@@ -53,7 +53,21 @@ namespace Configuration {
         }
         float fvalue;
         if (str.isFloat(fvalue)) {
-            return int(round(fvalue));
+            return lroundf(fvalue);
+        }
+        parseError("Expected an integer value");
+        return 0;
+    }
+
+    uint32_t Parser::uintValue() const {
+        auto     str = StringRange(token_.sValueStart_, token_.sValueEnd_);
+        uint32_t value;
+        if (str.isUnsignedInteger(value)) {
+            return value;
+        }
+        float fvalue;
+        if (str.isFloat(fvalue)) {
+            return lroundf(fvalue);
         }
         parseError("Expected an integer value");
         return 0;
@@ -78,15 +92,19 @@ namespace Configuration {
             StringRange speed = entryStr.nextWord('=');
             if (!speed.length() || !speed.isUInteger(entry.speed)) {
                 log_error("Bad speed number " << speed.str());
+                value.clear();
                 break;
             }
             StringRange percent = entryStr.nextWord('%');
             if (!percent.length() || !percent.isFloat(entry.percent)) {
                 log_error("Bad speed percent " << percent.str());
+                value.clear();
                 break;
             }
             value.push_back(entry);
         }
+        if (!value.size())
+            log_info("Using default speed map");
         return value;
     }
 
@@ -98,7 +116,7 @@ namespace Configuration {
     IPAddress Parser::ipValue() const {
         IPAddress ip;
         auto      str = StringRange(token_.sValueStart_, token_.sValueEnd_);
-        if (!ip.fromString(str.str())) {
+        if (!ip.fromString(str.str().c_str())) {
             parseError("Expected an IP address like 192.168.0.100");
         }
         return ip;
@@ -118,7 +136,7 @@ namespace Configuration {
         auto str = StringRange(token_.sValueStart_, token_.sValueEnd_);
         if (str.length() == 5 || str.length() == 3) {
             int32_t wordLenInt;
-            if (!str.subString(0, 1).isInteger(wordLenInt)) {
+            if (!str.substr(0, 1).isInteger(wordLenInt)) {
                 parseError("Uart mode should be specified as [Bits Parity Stopbits] like [8N1]");
             } else if (wordLenInt < 5 || wordLenInt > 8) {
                 parseError("Number of data bits for uart is out of range. Expected format like [8N1].");
@@ -127,12 +145,15 @@ namespace Configuration {
 
             switch (str.begin()[1]) {
                 case 'N':
+                case 'n':
                     parity = UartParity::None;
                     break;
                 case 'O':
+                case 'o':
                     parity = UartParity::Odd;
                     break;
                 case 'E':
+                case 'e':
                     parity = UartParity::Even;
                     break;
                 default:
@@ -140,7 +161,7 @@ namespace Configuration {
                     break;  // Omits compiler warning. Never hit.
             }
 
-            auto stop = str.subString(2, str.length() - 2);
+            auto stop = str.substr(2, str.length() - 2);
             if (stop.equals("1")) {
                 stopBits = UartStop::Bits1;
             } else if (stop.equals("1.5")) {

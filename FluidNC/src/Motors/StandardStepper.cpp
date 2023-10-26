@@ -12,23 +12,54 @@
 #include "../Stepping.h"  // config->_stepping->_engine
 
 #include <esp32-hal-gpio.h>  // gpio
+#include <sdkconfig.h>       // CONFIG_IDF_TARGET_*
 
 using namespace Machine;
 
 namespace MotorDrivers {
-    rmt_item32_t StandardStepper::rmtItem[2];
-    rmt_config_t StandardStepper::rmtConfig;
 
-    // Get an RMT channel number
-    // returns RMT_CHANNEL_MAX for error
-    rmt_channel_t StandardStepper::get_next_RMT_chan_num() {
-        static uint8_t next_RMT_chan_num = uint8_t(RMT_CHANNEL_0);  // channels 0-7 are valid
-        if (next_RMT_chan_num < RMT_CHANNEL_MAX) {
-            next_RMT_chan_num++;
-        } else {
-            log_error("Out of RMT channels");
+    static void init_rmt_channel(rmt_channel_t& rmt_chan_num, Pin& step_pin, bool invert_step, uint32_t dir_delay_ms, uint32_t pulse_us) {
+        static rmt_channel_t next_RMT_chan_num = RMT_CHANNEL_0;
+        if (rmt_chan_num == RMT_CHANNEL_MAX) {
+            if (next_RMT_chan_num == RMT_CHANNEL_MAX) {
+                log_error("Out of RMT channels");
+                return;
+            }
+            rmt_chan_num      = next_RMT_chan_num;
+            next_RMT_chan_num = static_cast<rmt_channel_t>(static_cast<int>(next_RMT_chan_num) + 1);
         }
-        return rmt_channel_t(next_RMT_chan_num);
+
+        auto step_pin_gpio = step_pin.getNative(Pin::Capabilities::Output);
+
+        rmt_config_t rmtConfig = { .rmt_mode      = RMT_MODE_TX,
+                                   .channel       = rmt_chan_num,
+                                   .gpio_num      = gpio_num_t(step_pin_gpio),
+                                   .clk_div       = 20,
+                                   .mem_block_num = 2,
+                                   .flags         = 0,
+                                   .tx_config     = {
+                                       .carrier_freq_hz      = 0,
+                                       .carrier_level        = RMT_CARRIER_LEVEL_LOW,
+                                       .idle_level           = invert_step ? RMT_IDLE_LEVEL_HIGH : RMT_IDLE_LEVEL_LOW,
+                                       .carrier_duty_percent = 50,
+#if SOC_RMT_SUPPORT_TX_LOOP_COUNT
+                                       .loop_count = 1,
+#endif
+                                       .carrier_en     = false,
+                                       .loop_en        = false,
+                                       .idle_output_en = true,
+                                   } };
+
+        rmt_item32_t rmtItem[2];
+        rmtItem[0].duration0 = dir_delay_ms ? dir_delay_ms * 4 : 1;
+        rmtItem[0].duration1 = 4 * pulse_us;
+        rmtItem[1].duration0 = 0;
+        rmtItem[1].duration1 = 0;
+
+        rmtItem[0].level0 = rmtConfig.tx_config.idle_level;
+        rmtItem[0].level1 = !rmtConfig.tx_config.idle_level;
+        rmt_config(&rmtConfig);
+        rmt_fill_tx_items(rmtConfig.channel, &rmtItem[0], rmtConfig.mem_block_num, 0);
     }
 
     void StandardStepper::init() {
@@ -48,35 +79,7 @@ namespace MotorDrivers {
 
         auto stepping = config->_stepping;
         if (stepping->_engine == Stepping::RMT) {
-            rmtConfig.rmt_mode                       = RMT_MODE_TX;
-            rmtConfig.clk_div                        = 20;
-            rmtConfig.mem_block_num                  = 2;
-            rmtConfig.tx_config.loop_en              = false;
-            rmtConfig.tx_config.carrier_en           = false;
-            rmtConfig.tx_config.carrier_freq_hz      = 0;
-            rmtConfig.tx_config.carrier_duty_percent = 50;
-            rmtConfig.tx_config.carrier_level        = RMT_CARRIER_LEVEL_LOW;
-            rmtConfig.tx_config.idle_output_en       = true;
-
-            rmtItem[0].duration0 = stepping->_directionDelayUsecs ? stepping->_directionDelayUsecs * 4 : 1;
-            rmtItem[0].duration1 = 4 * stepping->_pulseUsecs;
-            rmtItem[1].duration0 = 0;
-            rmtItem[1].duration1 = 0;
-
-            _rmt_chan_num = get_next_RMT_chan_num();
-            if (_rmt_chan_num == RMT_CHANNEL_MAX) {
-                return;
-            }
-
-            auto step_pin_gpio = _step_pin.getNative(Pin::Capabilities::Output);
-            rmt_set_source_clk(_rmt_chan_num, RMT_BASECLK_APB);
-            rmtConfig.channel              = _rmt_chan_num;
-            rmtConfig.tx_config.idle_level = _invert_step ? RMT_IDLE_LEVEL_HIGH : RMT_IDLE_LEVEL_LOW;
-            rmtConfig.gpio_num             = gpio_num_t(step_pin_gpio);
-            rmtItem[0].level0              = rmtConfig.tx_config.idle_level;
-            rmtItem[0].level1              = !rmtConfig.tx_config.idle_level;
-            rmt_config(&rmtConfig);
-            rmt_fill_tx_items(rmtConfig.channel, &rmtItem[0], rmtConfig.mem_block_num, 0);
+            init_rmt_channel(_rmt_chan_num, _step_pin, _invert_step, stepping->_directionDelayUsecs, stepping->_pulseUsecs);
         } else {
             _step_pin.setAttr(Pin::Attr::Output);
         }
@@ -85,13 +88,21 @@ namespace MotorDrivers {
     }
 
     void StandardStepper::config_message() {
-        log_info("    Standard Stepper Step:" << _step_pin.name() << " Dir:" << _dir_pin.name() << " Disable:" << _disable_pin.name());
+        log_info("    " << name() << " Step:" << _step_pin.name() << " Dir:" << _dir_pin.name() << " Disable:" << _disable_pin.name());
     }
 
     void IRAM_ATTR StandardStepper::step() {
-        if (config->_stepping->_engine == Stepping::RMT) {
+        if (config->_stepping->_engine == Stepping::RMT && _rmt_chan_num != RMT_CHANNEL_MAX) {
+#ifdef CONFIG_IDF_TARGET_ESP32
             RMT.conf_ch[_rmt_chan_num].conf1.mem_rd_rst = 1;
+            RMT.conf_ch[_rmt_chan_num].conf1.mem_rd_rst = 0;
             RMT.conf_ch[_rmt_chan_num].conf1.tx_start   = 1;
+#endif
+#ifdef CONFIG_IDF_TARGET_ESP32S3
+            RMT.chnconf0[_rmt_chan_num].mem_rd_rst_n = 1;
+            RMT.chnconf0[_rmt_chan_num].mem_rd_rst_n = 0;
+            RMT.chnconf0[_rmt_chan_num].tx_start_n   = 1;
+#endif
         } else {
             _step_pin.on();
         }
@@ -112,17 +123,20 @@ namespace MotorDrivers {
         MotorFactory::InstanceBuilder<StandardStepper> registration("standard_stepper");
     }
 
-    void StandardStepper::validate() const {
+    void StandardStepper::validate() {
         Assert(_step_pin.defined(), "Step pin must be configured.");
-        Assert(_dir_pin.defined(), "Direction pin must be configured.");
         bool isI2SO = config->_stepping->_engine == Stepping::I2S_STREAM || config->_stepping->_engine == Stepping::I2S_STATIC;
         if (isI2SO) {
-            Assert(_step_pin.name().startsWith("I2SO"), "Step pin must be an I2SO pin");
-            Assert(_dir_pin.name().startsWith("I2SO"), "Direction pin must be an I2SO pin");
+            Assert(_step_pin.name().rfind("I2SO", 0) == 0, "Step pin must be an I2SO pin");
+            if (_dir_pin.defined()) {
+                Assert(_dir_pin.name().rfind("I2SO", 0) == 0, "Direction pin must be an I2SO pin");
+            }
+
         } else {
-            Assert(_step_pin.name().startsWith("gpio"), "Step pin must be a GPIO pin");
-            Assert(_dir_pin.name().startsWith("gpio"), "Direction pin must be a GPIO pin");
+            Assert(_step_pin.name().rfind("gpio", 0) == 0, "Step pin must be a GPIO pin");
+            if (_dir_pin.defined()) {
+                Assert(_dir_pin.name().rfind("gpio", 0) == 0, "Direction pin must be a GPIO pin");
+            }
         }
     }
-
 }

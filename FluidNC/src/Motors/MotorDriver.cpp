@@ -26,8 +26,8 @@
 #include "../Limits.h"  // limitsMinPosition
 
 namespace MotorDrivers {
-    String MotorDriver::axisName() const {
-        return String(config->_axes->axisName(axis_index())) + (dual_axis_index() ? "2" : "") + " Axis";
+    std::string MotorDriver::axisName() const {
+        return std::string(1, config->_axes->axisName(axis_index())) + (dual_axis_index() ? "2" : "") + " Axis";
     }
 
     void MotorDriver::debug_message() {}
@@ -43,4 +43,7 @@ namespace MotorDrivers {
         return size_t(config->_axes->findAxisMotor(this));
     }
     void IRAM_ATTR MotorDriver::set_disable(bool disable) {}
+    void IRAM_ATTR MotorDriver::set_direction(bool) {}
+    void IRAM_ATTR MotorDriver::step() {}
+    void IRAM_ATTR MotorDriver::unstep() {}
 }

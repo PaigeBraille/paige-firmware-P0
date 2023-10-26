@@ -8,12 +8,15 @@
 #    include "../Machine/MachineConfig.h"
 #    include "../Report.h"  // CLIENT_*
 #    include "Commands.h"   // COMMANDS
+#    include "WebSettings.h"
 
 #    include <cstdint>
 
 // SerialBT sends the data over Bluetooth
 namespace WebUI {
+    BTConfig        bt_config;
     BluetoothSerial SerialBT;
+    BTChannel       btChannel;
 }
 // The instance variable for the BTConfig class is in config->_comms
 
@@ -22,9 +25,33 @@ const uint8_t* esp_bt_dev_get_address(void);
 }
 
 namespace WebUI {
+    EnumSetting*   bt_enable;
+    StringSetting* bt_name;
+
+    size_t BTChannel::write(uint8_t data) {
+        static uint8_t lastchar = '\0';
+        if (_addCR && data == '\n' && lastchar != '\r') {
+            SerialBT.write('\r');
+        }
+        lastchar = data;
+        return SerialBT.write(data);
+    }
+
     BTConfig* BTConfig::instance = nullptr;
 
-    BTConfig::BTConfig() {}
+    BTConfig::BTConfig() {
+        bt_enable = new EnumSetting("Bluetooth Enable", WEBSET, WA, "ESP141", "Bluetooth/Enable", 1, &onoffOptions, NULL);
+
+        bt_name = new StringSetting("Bluetooth name",
+                                    WEBSET,
+                                    WA,
+                                    "ESP140",
+                                    "Bluetooth/Name",
+                                    DEFAULT_BT_NAME,
+                                    WebUI::BTConfig::MIN_BTNAME_LENGTH,
+                                    WebUI::BTConfig::MAX_BTNAME_LENGTH,
+                                    (bool (*)(char*))BTConfig::isBTnameValid);
+    }
 
     void BTConfig::my_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t* param) {
         auto inst = instance;
@@ -46,17 +73,17 @@ namespace WebUI {
         }
     }
 
-    String BTConfig::info() {
-        String result;
-        String tmp;
-        if (Is_BT_on()) {
+    std::string BTConfig::info() {
+        std::string result;
+        if (isOn()) {
             result += "Mode=BT:Name=";
-            result += _btname;
+            result += _btname.c_str();
             result += "(";
             result += device_address();
             result += "):Status=";
             if (SerialBT.hasClient()) {
-                result += "Connected with " + _btclient;
+                result += "Connected with ";
+                result + _btclient.c_str();
             } else {
                 result += "Not connected";
             }
@@ -95,27 +122,57 @@ namespace WebUI {
         return str;
     }
 
+    int BTChannel::available() { return SerialBT.available(); }
+    int BTChannel::read() { return SerialBT.read(); }
+    int BTChannel::peek() { return SerialBT.peek(); }
+
+    bool BTChannel::realtimeOkay(char c) { return _lineedit->realtime(c); }
+
+    bool BTChannel::lineComplete(char* line, char c) {
+        if (_lineedit->step(c)) {
+            _linelen        = _lineedit->finish();
+            _line[_linelen] = '\0';
+            strcpy(line, _line);
+            _linelen = 0;
+            return true;
+        }
+        return false;
+    }
+
+    Channel* BTChannel::pollLine(char* line) {
+        // UART0 is the only Uart instance that can be a channel input device
+        // Other UART users like RS485 use it as a dumb character device
+        if (_lineedit == nullptr) {
+            return nullptr;
+        }
+        return Channel::pollLine(line);
+    }
+
     /**
      * begin WiFi setup
      */
     bool BTConfig::begin() {
         instance = this;
 
-        log_debug("Begin");
+        log_debug("Begin Bluetooth setup");
         //stop active services
         end();
 
-        log_debug("end");
+        if (!bt_enable->get()) {
+            log_info("Bluetooth not enabled");
+            return false;
+        }
+
+        _btname = bt_name->getStringValue();
+
         if (_btname.length()) {
-            log_debug("length");
-            if (!SerialBT.begin(_btname)) {
-                log_debug("name");
-                report_status_message(Error::BtFailBegin, allClients);
+            if (!SerialBT.begin(_btname.c_str())) {
+                log_error("Bluetooth failed to start");
                 return false;
             }
-            log_debug("register");
             SerialBT.register_callback(&my_spp_cb);
             log_info("BT Started with " << _btname);
+            allChannels.registration(&btChannel);
             return true;
         }
         log_info("BT is not enabled");
@@ -126,33 +183,22 @@ namespace WebUI {
     /**
      * End WiFi
      */
-    void BTConfig::end() { SerialBT.end(); }
-
-    /**
-     * Reset Bluetooth settings
-     * XXX this is not called from anywhere
-     */
-    void BTConfig::reset_settings() {
-        auto bt = config->_comms->_bluetoothConfig;
-        if (bt) {
-            delete bt;
-            config->_comms->_bluetoothConfig = nullptr;
+    void BTConfig::end() {
+        if (isOn()) {
+            SerialBT.end();
+            allChannels.deregistration(&btChannel);
         }
-        log_info("BT reset done");
     }
 
     /**
      * Check if BT is on and working
      */
-    bool BTConfig::Is_BT_on() const { return btStarted(); }
+    bool BTConfig::isOn() const { return btStarted(); }
 
     /**
      * Handle not critical actions that must be done in sync environement
      */
-    void BTConfig::handle() {
-        //If needed
-        COMMANDS::wait(0);
-    }
+    void BTConfig::handle() {}
 
     BTConfig::~BTConfig() { end(); }
 }

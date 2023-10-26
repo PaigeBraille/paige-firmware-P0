@@ -7,12 +7,11 @@
 namespace WebUI {
     class COMMANDS {
     public:
-        static void wait(uint32_t milliseconds);
         static void handle();
-        static void restart_ESP();
+        static void restart_MCU();
         static bool isLocalPasswordValid(char* password);
 
     private:
-        static bool restart_ESP_module;
+        static bool _restart_MCU;
     };
 }

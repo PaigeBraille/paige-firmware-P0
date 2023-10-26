@@ -16,13 +16,16 @@
 namespace Stepper {
     void init();
 
-    void pulse_func();
+    bool pulse_func();
 
     // Enable steppers, but cycle does not start unless called by motion control or realtime command.
     void wake_up();
 
-    // Stops stepping
+    // Stops stepping and disables stepper (not ISR-safe)
     void go_idle();
+
+    // Stops stepping (ISR-safe)
+    void stop_stepping();
 
     // Reset the stepper subsystem variables
     void reset();
@@ -37,11 +40,10 @@ namespace Stepper {
     void prep_buffer();
 
     // Called by planner_recalculate() when the executing block is updated by the new plan.
-    void update_plan_block_parameters();
+    bool update_plan_block_parameters();
 
     // Called by realtime status reporting if realtime rate reporting is enabled in config.h.
     float get_realtime_rate();
 
-    extern uint32_t isr_count;  // for debugging only
+    extern uint32_t isr_count;
 }
-// private

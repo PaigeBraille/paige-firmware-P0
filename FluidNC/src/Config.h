@@ -18,16 +18,33 @@ Some features should not be changed. See notes below.
 
 */
 
-#include "NutsBolts.h"
-
 // It is no longer necessary to edit this file to choose
 // a machine configuration; edit machine.h instead
 // machine.h is #included below, after some definitions
 // that the machine file might choose to undefine.
 
-const int SUPPORT_TASK_CORE = 1;  // Reference: CONFIG_ARDUINO_RUNNING_CORE = 1
-
 const int MAX_N_AXIS = 6;
+
+const int MAX_MESSAGE_LINE = 256;
+
+// Axis array index values. Must start with 0 and be continuous.
+// Note: You set the number of axes used by changing MAX_N_AXIS.
+// Be sure to define pins or servos in the machine definition file.
+const int X_AXIS = 0;  // Axis indexing value.
+const int Y_AXIS = 1;
+const int Z_AXIS = 2;
+const int A_AXIS = 3;
+const int B_AXIS = 4;
+const int C_AXIS = 5;
+
+const int X2_AXIS = (X_AXIS + MAX_N_AXIS);
+const int Y2_AXIS = (Y_AXIS + MAX_N_AXIS);
+const int Z2_AXIS = (Z_AXIS + MAX_N_AXIS);
+const int A2_AXIS = (A_AXIS + MAX_N_AXIS);
+const int B2_AXIS = (B_AXIS + MAX_N_AXIS);
+const int C2_AXIS = (C_AXIS + MAX_N_AXIS);
+
+const int SUPPORT_TASK_CORE = 0;  // Reference: CONFIG_ARDUINO_RUNNING_CORE = 1
 
 // Serial baud rate
 // OK to change, but the ESP32 boot text is 115200, so you will not see that is your
@@ -56,11 +73,6 @@ const char* const DEFAULT_USER_PWD    = "user";
 const char* const DEFAULT_ADMIN_LOGIN = "admin";
 const char* const DEFAULT_USER_LOGIN  = "user";
 #endif
-
-// Number of homing cycles performed after when the machine initially jogs to limit switches.
-// This help in preventing overshoot and should improve repeatability. This value should be one or
-// greater.
-static const uint8_t NHomingLocateCycle = 1;  // Integer (1-128)
 
 // Upon a successful probe cycle, this option provides immediately feedback of the probe coordinates
 // through an automatically generated message. If disabled, users can still access the last probe
@@ -101,7 +113,7 @@ namespace SpindleSpeedOverride {
     const int Min             = 10;   // Percent of programmed spindle speed (1-100). Usually 10%.
     const int CoarseIncrement = 10;   // (1-99). Usually 10%.
     const int FineIncrement   = 1;    // (1-99). Usually 1%.
-}
+};
 
 // When a M2 or M30 program end command is executed, most GCode states are restored to their defaults.
 // This compile-time option includes the restoring of the feed, rapid, and spindle speed override values
@@ -166,13 +178,6 @@ const int N_ARC_CORRECTION = 12;  // Integer (1-255)
 // much greater than this. The default setting should capture most, if not all, full arc error situations.
 const double ARC_ANGULAR_TRAVEL_EPSILON = 5E-7;  // Float (radians)
 
-// Time delay increments performed during a dwell. The default value is set at 50ms, which provides
-// a maximum time delay of roughly 55 minutes, more than enough for most any application. Increasing
-// this delay will increase the maximum dwell time linearly, but also reduces the responsiveness of
-// run-time command executions, like status reports, since these are performed between each dwell
-// time step. Also, keep in mind that the Arduino delay timer is not very accurate for long delays.
-const int DWELL_TIME_STEP = 50;  // Integer (1-255) (milliseconds)
-
 // Serial send and receive buffer size. The receive buffer is often used as another streaming
 // buffer to store incoming blocks to be processed when ready. Most streaming
 // interfaces will character count and track each block send to each block response. So,
@@ -209,10 +214,6 @@ const bool FORCE_BUFFER_SYNC_DURING_WCO_CHANGE = true;  // Default enabled. Comm
 // repeatable. If needed, you can disable this behavior by uncommenting the define below.
 const bool ALLOW_FEED_OVERRIDE_DURING_PROBE_CYCLES = false;
 
-// Configure options for the parking motion, if enabled.
-#define PARKING_AXIS Z_AXIS                      // Define which axis that performs the parking motion
-const double PARKING_TARGET            = -5.0;   // Parking axis target. In mm, as machine coordinate.
-const double PARKING_RATE              = 800.0;  // Parking fast rate after pull-out in mm/min.
-const double PARKING_PULLOUT_RATE      = 250.0;  // Pull-out/plunge slow feed rate in mm/min.
-const double PARKING_PULLOUT_INCREMENT = 5.0;    // Spindle pull-out and plunge distance in mm. Incremental distance.
-// Must be positive value or equal to zero.
+const int MAX_N_I2C = 2;
+
+#include "NutsBolts.h"

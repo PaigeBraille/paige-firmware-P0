@@ -1,28 +1,21 @@
 #pragma once
 
 #include "Pin.h"
+#include "Platform.h"
+#include "Machine/EventPin.h"
 
-class ControlPin {
-private:
-    bool           _value;
-    const char     _letter;
-    volatile bool& _rtVariable;
-    const char*    _legend;
+namespace Machine {
+    class ControlPin : public Machine::EventPin {
+    private:
+        const char _letter;  // The name that appears in init() messages and the name of the configuration item
 
-    void handleISR();
+    public:
+        ControlPin(Event* event, const char* legend, char letter) :
+            EventPin(event, legend, &_pin), _letter(letter) 
+        {}
 
-public:
-    ControlPin(volatile bool& rtVariable, const char* legend, char letter) :
-        _value(false), _letter(letter), _rtVariable(rtVariable), _legend(legend) {
-        _rtVariable = _value;
-    }
+        Pin _pin;
 
-    Pin _pin;
-
-    void init();
-    bool get() { return _value; }
-
-    void report(char* status);
-
-    ~ControlPin();
-};
+        char letter() { return _letter; };
+    };
+}

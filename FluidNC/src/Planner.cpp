@@ -9,16 +9,23 @@
 */
 
 #include "Planner.h"
-
 #include "Machine/MachineConfig.h"
 
-#include <stdlib.h>  // PSoc Required for labs
+#include <cstdlib>  // PSoc Required for labs
+#include <cmath>
 
-static plan_block_t block_buffer[BLOCK_BUFFER_SIZE];  // A ring buffer for motion instructions
-static uint8_t      block_buffer_tail;                // Index of the block to process now
-static uint8_t      block_buffer_head;                // Index of the next block to be pushed
-static uint8_t      next_buffer_head;                 // Index of the next buffer head
-static uint8_t      block_buffer_planned;             // Index of the optimally planned block
+static plan_block_t* block_buffer = nullptr;  // A ring buffer for motion instructions
+static uint8_t       block_buffer_tail;       // Index of the block to process now
+static uint8_t       block_buffer_head;       // Index of the next block to be pushed
+static uint8_t       next_buffer_head;        // Index of the next buffer head
+static uint8_t       block_buffer_planned;    // Index of the optimally planned block
+
+void plan_init() {
+    if (block_buffer) {
+        delete[] block_buffer;
+    }
+    block_buffer = new plan_block_t[config->_planner_blocks];
+}
 
 // Define planner variables
 typedef struct {
@@ -31,9 +38,9 @@ typedef struct {
 static planner_t pl;
 
 // Returns the index of the next block in the ring buffer. Also called by stepper segment buffer.
-uint8_t plan_next_block_index(uint8_t block_index) {
+static uint8_t plan_next_block_index(uint8_t block_index) {
     block_index++;
-    if (block_index == BLOCK_BUFFER_SIZE) {
+    if (block_index == config->_planner_blocks) {
         block_index = 0;
     }
     return block_index;
@@ -42,7 +49,7 @@ uint8_t plan_next_block_index(uint8_t block_index) {
 // Returns the index of the previous block in the ring buffer
 static uint8_t plan_prev_block_index(uint8_t block_index) {
     if (block_index == 0) {
-        block_index = BLOCK_BUFFER_SIZE;
+        block_index = config->_planner_blocks;
     }
     block_index--;
     return block_index;
@@ -195,6 +202,7 @@ void plan_reset_buffer() {
     block_buffer_planned = 0;  // = block_buffer_tail;
 }
 
+// Called from stepper pulse function when the block is complete
 void plan_discard_current_block() {
     if (block_buffer_head != block_buffer_tail) {  // Discard non-empty buffer.
         uint8_t block_index = plan_next_block_index(block_buffer_tail);
@@ -237,10 +245,10 @@ uint8_t plan_check_full_buffer() {
 float plan_compute_profile_nominal_speed(plan_block_t* block) {
     float nominal_speed = block->programmed_rate;
     if (block->motion.rapidMotion) {
-        nominal_speed *= (0.01f * sys.r_override);
+        nominal_speed *= (0.01f * sys.r_override());
     } else {
         if (!(block->motion.noFeedOverride)) {
-            nominal_speed *= (0.01f * sys.f_override);
+            nominal_speed *= (0.01f * sys.f_override());
         }
         if (nominal_speed > block->rapid_rate) {
             nominal_speed = block->rapid_rate;
@@ -292,22 +300,20 @@ bool plan_buffer_line(float* target, plan_line_data_t* pl_data) {
     block->spindle       = pl_data->spindle;
     block->spindle_speed = pl_data->spindle_speed;
     block->line_number   = pl_data->line_number;
+    block->is_jog        = pl_data->is_jog;
 
     // Compute and store initial move distance data.
     int32_t target_steps[MAX_N_AXIS], position_steps[MAX_N_AXIS];
     float   unit_vec[MAX_N_AXIS], delta_mm;
     // Copy position data based on type of motion being planned.
-    if (block->motion.systemMotion) {
-        memcpy(position_steps, motor_steps, sizeof(motor_steps));
-    } else {
-        memcpy(position_steps, pl.position, sizeof(pl.position));
-    }
+    copyAxes(position_steps, block->motion.systemMotion ? get_motor_steps() : pl.position);
+
     auto n_axis = config->_axes->_numberAxis;
     for (size_t idx = 0; idx < n_axis; idx++) {
         // Calculate target position in absolute steps, number of steps for each axis, and determine max step events.
         // Also, compute individual axes distance for move and prep unit vector calculations.
         // NOTE: Computes true distance from converted step values.
-        target_steps[idx]       = lround(mpos_to_steps(target[idx], idx));
+        target_steps[idx]       = mpos_to_steps(target[idx], idx);
         block->steps[idx]       = labs(target_steps[idx] - position_steps[idx]);
         block->step_event_count = MAX(block->step_event_count, block->steps[idx]);
         delta_mm                = steps_to_mpos((target_steps[idx] - position_steps[idx]), idx);
@@ -383,7 +389,7 @@ bool plan_buffer_line(float* target, plan_line_data_t* pl_data) {
             } else {
                 convert_delta_vector_to_unit_vector(junction_unit_vec);
                 float junction_acceleration = limit_acceleration_by_axis_maximum(junction_unit_vec);
-                float sin_theta_d2 = float(sqrt(0.5f * (1.0f - junction_cos_theta)));  // Trig half angle identity. Always positive.
+                float sin_theta_d2          = sqrtf(0.5f * (1.0f - junction_cos_theta));  // Trig half angle identity. Always positive.
                 block->max_junction_speed_sqr =
                     MAX(MINIMUM_JUNCTION_SPEED * MINIMUM_JUNCTION_SPEED,
                         (junction_acceleration * config->_junctionDeviation * sin_theta_d2) / (1.0f - sin_theta_d2));
@@ -396,8 +402,8 @@ bool plan_buffer_line(float* target, plan_line_data_t* pl_data) {
         plan_compute_profile_parameters(block, nominal_speed, pl.previous_nominal_speed);
         pl.previous_nominal_speed = nominal_speed;
         // Update previous path unit_vector and planner position.
-        memcpy(pl.previous_unit_vec, unit_vec, sizeof(unit_vec));  // pl.previous_unit_vec[] = unit_vec[]
-        memcpy(pl.position, target_steps, sizeof(target_steps));   // pl.position[] = target_steps[]
+        copyAxes(pl.previous_unit_vec, unit_vec);
+        copyAxes(pl.position, target_steps);
         // New block is all set. Update buffer head and next buffer head indices.
         block_buffer_head = next_buffer_head;
         next_buffer_head  = plan_next_block_index(block_buffer_head);
@@ -411,29 +417,18 @@ bool plan_buffer_line(float* target, plan_line_data_t* pl_data) {
 void plan_sync_position() {
     // TODO: For motor configurations not in the same coordinate frame as the machine position,
     // this function needs to be updated to accomodate the difference.
-    auto a      = config->_axes;
-    auto n_axis = a ? a->_numberAxis : 0;
-    for (size_t idx = 0; idx < n_axis; idx++) {
-        pl.position[idx] = motor_steps[idx];
+    if (config->_axes) {
+        copyAxes(pl.position, get_motor_steps());
     }
 }
 
 // Returns the number of available blocks are in the planner buffer.
+// Called from report_realtime_status
 uint8_t plan_get_block_buffer_available() {
     if (block_buffer_head >= block_buffer_tail) {
-        return (BLOCK_BUFFER_SIZE - 1) - (block_buffer_head - block_buffer_tail);
+        return (config->_planner_blocks - 1) - (block_buffer_head - block_buffer_tail);
     } else {
         return block_buffer_tail - block_buffer_head - 1;
-    }
-}
-
-// Returns the number of active blocks are in the planner buffer.
-// NOTE: Deprecated. Not used unless classic status reports are enabled in config.h
-uint8_t plan_get_block_buffer_count() {
-    if (block_buffer_head >= block_buffer_tail) {
-        return block_buffer_head - block_buffer_tail;
-    } else {
-        return BLOCK_BUFFER_SIZE - (block_buffer_tail - block_buffer_head);
     }
 }
 

@@ -3,6 +3,7 @@
 // Use of this source code is governed by a GPLv3 license that can be found in the LICENSE file.
 
 #include "CoolantControl.h"
+#include "System.h"
 
 void CoolantControl::init() {
     static bool init_message = true;  // used to show messages only once.
@@ -67,7 +68,7 @@ void CoolantControl::stop() {
 // parser program end, and g-code parser CoolantControl::sync().
 
 void CoolantControl::set_state(CoolantState state) {
-    if (sys.abort) {
+    if (sys.abort()) {
         return;  // Block during abort.
     }
     write(state);
@@ -80,7 +81,7 @@ void CoolantControl::off() {
 }
 
 void CoolantControl::group(Configuration::HandlerBase& handler) {
-    handler.item("flood", _flood);
-    handler.item("mist", _mist);
-    handler.item("delay_ms", _delay_ms);
+    handler.item("flood_pin", _flood);
+    handler.item("mist_pin", _mist);
+    handler.item("delay_ms", _delay_ms, 0, 10000);
 }

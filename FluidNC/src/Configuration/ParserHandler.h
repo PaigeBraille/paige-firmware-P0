@@ -8,8 +8,6 @@
 #include "Configurable.h"
 #include "../System.h"
 
-#include "../Logging.h"
-
 #include <vector>
 
 // #define DEBUG_VERBOSE_YAML_PARSER
@@ -51,8 +49,8 @@ namespace Configuration {
                                       << _parser.token_.indent_);
 #endif
                     if (_parser.token_.indent_ > thisIndent) {
-                        log_error("Skipping key " << _parser.key().str() << " indent " << _parser.token_.indent_ << " thisIndent "
-                                                 << thisIndent);
+                        log_error("Skipping key " << _parser.key().str() << " indent " << _parser.token_.indent_ << " this indent "
+                                                  << thisIndent);
                     } else {
 #ifdef DEBUG_VERBOSE_YAML_PARSER
                         log_debug("Parsing key " << _parser.key().str());
@@ -64,11 +62,11 @@ namespace Configuration {
                             log_error("Configuration error at "; for (auto it : _path) { ss << '/' << it; } ss << ": " << ex.msg);
 
                             // Set the state to config alarm, so users can't run time machine.
-                            sys.state = State::ConfigAlarm;
+                            sys.set_state(State::ConfigAlarm);
                         }
 
                         if (_parser.token_.state == TokenState::Matching) {
-                            log_error("Ignored key " << _parser.key().str());
+                            log_warn("Ignored key " << _parser.key().str());
                         }
 #ifdef DEBUG_CHATTY_YAML_PARSER
                         if (_parser.token_.state == Configuration::TokenState::Matched) {
@@ -102,6 +100,14 @@ namespace Configuration {
         void item(const char* name, int32_t& value, int32_t minValue, int32_t maxValue) override {
             if (_parser.is(name)) {
                 value = _parser.intValue();
+                constrain_with_message(value, minValue, maxValue, name);
+            }
+        }
+
+        void item(const char* name, uint32_t& value, uint32_t minValue, uint32_t maxValue) override {
+            if (_parser.is(name)) {
+                value = _parser.uintValue();
+                constrain_with_message(value, minValue, maxValue, name);
             }
         }
 
@@ -120,6 +126,7 @@ namespace Configuration {
         void item(const char* name, float& value, float minValue, float maxValue) override {
             if (_parser.is(name)) {
                 value = _parser.floatValue();
+                constrain_with_message(value, minValue, maxValue, name);
             }
         }
 
@@ -135,9 +142,9 @@ namespace Configuration {
             }
         }
 
-        void item(const char* name, String& value, int minLength, int maxLength) override {
+        void item(const char* name, std::string& value, int minLength, int maxLength) override {
             if (_parser.is(name)) {
-                value = _parser.stringValue().str();
+                value = _parser.stringValue().str().c_str();
             }
         }
 

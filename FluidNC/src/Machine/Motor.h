@@ -25,7 +25,7 @@ namespace Machine {
         int _motorNum;
 
     public:
-        Motor(int axis, int motorNum) : _axis(axis), _motorNum(motorNum) {}
+        Motor(int axis, int motorNum);
 
         MotorDrivers::MotorDriver* _driver  = nullptr;
         float                      _pulloff = 1.0f;  // mm
@@ -33,14 +33,26 @@ namespace Machine {
         Pin  _negPin;
         Pin  _posPin;
         Pin  _allPin;
-        bool _hardLimits = true;
+        bool _hardLimits = false;
+
+        int32_t _steps   = 0;
+        bool    _limited = false;  // _limited is set by the LimitPin ISR
+        bool    _blocked = false;  // _blocked is used during asymmetric homing pulloff
 
         // Configuration system helpers:
         void group(Configuration::HandlerBase& handler) override;
         void afterParse() override;
         bool hasSwitches();
+        bool isReal();
         void makeDualSwitches();
+        void limitOtherAxis(int axis);
         void init();
+        void config_motor();
+        void step(bool reverse);
+        void unstep();
+        void block() { _blocked = true; }
+        void unblock() { _blocked = false; }
+        void unlimit() { _limited = false; }
         ~Motor();
     };
 }

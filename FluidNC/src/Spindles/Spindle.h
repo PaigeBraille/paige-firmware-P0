@@ -10,6 +10,8 @@
 #include "../Configuration/Configurable.h"
 #include "../Configuration/GenericFactory.h"
 
+#include "../GCode.h"  // MaxToolNumber
+
 // ===============  No floats! ===========================
 // ================ NO FLOATS! ==========================
 
@@ -22,10 +24,10 @@ namespace Spindles {
     public:
         Spindle() = default;
 
-        Spindle(const Spindle&) = delete;
-        Spindle(Spindle&&)      = delete;
+        Spindle(const Spindle&)            = delete;
+        Spindle(Spindle&&)                 = delete;
         Spindle& operator=(const Spindle&) = delete;
-        Spindle& operator=(Spindle&&) = delete;
+        Spindle& operator=(Spindle&&)      = delete;
 
         bool     _defaultedSpeeds;
         uint32_t offSpeed() { return _speeds[0].offset; }
@@ -35,7 +37,7 @@ namespace Spindles {
         void     shelfSpeeds(SpindleSpeed min, SpindleSpeed max);
         void     linearSpeeds(SpindleSpeed maxSpeed, float maxPercent);
 
-        static void switchSpindle(uint8_t new_tool, SpindleList spindles, Spindle*& spindle);
+        static void switchSpindle(uint32_t new_tool, SpindleList spindles, Spindle*& spindle);
 
         void         spindleDelay(SpindleState state, SpindleSpeed speed);
         virtual void init() = 0;  // not in constructor because this also gets called when $$ settings change
@@ -46,6 +48,7 @@ namespace Spindles {
         void         stop() { setState(SpindleState::Disable, 0); }
         virtual void config_message() = 0;
         virtual bool isRateAdjusted();
+        virtual bool use_delay_settings() const { return true; }
 
         virtual void setSpeedfromISR(uint32_t dev_speed) = 0;
 
@@ -64,21 +67,26 @@ namespace Spindles {
 
         std::vector<Configuration::speedEntry> _speeds;
 
+        bool _off_on_alarm = false;
+
         // Name is required for the configuration factory to work.
         virtual const char* name() const = 0;
 
         // Configuration handlers:
-        void validate() const override {
+        void validate() override {
             // TODO: Validate spinup/spindown delay?
         }
 
         void afterParse() override;
 
         void group(Configuration::HandlerBase& handler) override {
-            handler.item("spinup_ms", _spinup_ms);
-            handler.item("spindown_ms", _spindown_ms);
-            handler.item("tool", _tool);
-            handler.item("speeds", _speeds);
+            if (use_delay_settings()) {
+                handler.item("spinup_ms", _spinup_ms, 0, 60000);
+                handler.item("spindown_ms", _spindown_ms, 0, 60000);
+            }
+            handler.item("tool_num", _tool, 0, MaxToolNumber);
+            handler.item("speed_map", _speeds);
+            handler.item("off_on_alarm", _off_on_alarm);
         }
 
         // Virtual base classes require a virtual destructor.

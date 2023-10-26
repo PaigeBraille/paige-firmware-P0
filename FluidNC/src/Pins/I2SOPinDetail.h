@@ -2,9 +2,9 @@
 // Use of this source code is governed by a GPLv3 license that can be found in the LICENSE file.
 
 #pragma once
-#ifdef ESP32
 
-#    include "PinDetail.h"
+#include "PinDetail.h"
+#include "../Machine/I2SOBus.h"
 
 namespace Pins {
     class I2SOPinDetail : public PinDetail {
@@ -14,6 +14,9 @@ namespace Pins {
 
         static const int         nI2SOPins = 32;
         static std::vector<bool> _claimed;
+
+        bool              _lastWrittenValue = false;
+        Machine::I2SOBus* _i2soDriver              = nullptr;
 
     public:
         I2SOPinDetail(pinnum_t index, const PinOptionsParser& options);
@@ -27,10 +30,8 @@ namespace Pins {
         void          setAttr(PinAttributes value) override;
         PinAttributes getAttr() const override;
 
-        String toString() override;
+        std::string toString() override;
 
         ~I2SOPinDetail() override { _claimed[_index] = false; }
     };
 }
-
-#endif

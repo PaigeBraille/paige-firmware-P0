@@ -8,17 +8,16 @@
 */
 
 #include "Protocol.h"
+#include "Event.h"
 
 #include "Machine/MachineConfig.h"
+#include "Machine/Homing.h"
 #include "Report.h"         // report_feedback_message
 #include "Limits.h"         // limits_get_state, soft_limit
 #include "Planner.h"        // plan_get_current_block
 #include "MotionControl.h"  // PARKING_MOTION_LINE_NUMBER
 #include "Settings.h"       // settings_execute_startup
-
-#ifdef DEBUG_REPORT_REALTIME
-volatile bool rtExecDebug;
-#endif
+#include "Machine/LimitPin.h"
 
 volatile ExecAlarm rtAlarm;  // Global realtime executor bitflag variable for setting various alarms.
 
@@ -34,25 +33,15 @@ std::map<ExecAlarm, const char*> AlarmNames = {
     { ExecAlarm::HomingFailPulloff, "Homing Fail Pulloff" },
     { ExecAlarm::HomingFailApproach, "Homing Fail Approach" },
     { ExecAlarm::SpindleControl, "Spindle Control" },
+    { ExecAlarm::ControlPin, "Control Pin Initially On" },
+    { ExecAlarm::HomingAmbiguousSwitch, "Ambiguous Switch" },
 };
 
-volatile Accessory rtAccessoryOverride;  // Global realtime executor bitflag variable for spindle/coolant overrides.
-volatile Percent   rtFOverride;          // Global realtime executor feedrate override percentage
-volatile Percent   rtROverride;          // Global realtime executor rapid override percentage
-volatile Percent   rtSOverride;          // Global realtime executor spindle override percentage
-
-volatile bool rtStatusReport;
-volatile bool rtCycleStart;
-volatile bool rtFeedHold;
 volatile bool rtReset;
-volatile bool rtSafetyDoor;
-volatile bool rtMotionCancel;
-volatile bool rtSleep;
-volatile bool rtCycleStop;  // For state transitions, instead of bitflag
-volatile bool rtButtonMacro0;
-volatile bool rtButtonMacro1;
-volatile bool rtButtonMacro2;
-volatile bool rtButtonMacro3;
+
+static volatile bool rtSafetyDoor;
+
+volatile bool runLimitLoop;  // Interface to show_limits()
 
 static void protocol_exec_rt_suspend();
 
@@ -76,30 +65,15 @@ union SpindleStop {
 
 static SpindleStop spindle_stop_ovr;
 
-bool can_park() {
-    if (config->_enableParkingOverrideControl) {
-        return sys.override_ctrl == Override::ParkingMotion && Machine::Axes::homingMask && !config->_laserMode;
-    } else {
-        return Machine::Axes::homingMask && !config->_laserMode;
-    }
-}
-
 void protocol_reset() {
-    probeState                = ProbeState::Off;
-    rtStatusReport            = false;
-    rtCycleStart              = false;
-    rtFeedHold                = false;
-    rtReset                   = false;
-    rtSafetyDoor              = false;
-    rtMotionCancel            = false;
-    rtSleep                   = false;
-    rtCycleStop               = false;
-    rtAccessoryOverride.value = 0;
-    rtAlarm                   = ExecAlarm::None;
-    rtFOverride               = FeedOverride::Default;
-    rtROverride               = RapidOverride::Default;
-    rtSOverride               = SpindleSpeedOverride::Default;
-    spindle_stop_ovr.value    = 0;
+    probeState             = ProbeState::Off;
+    soft_limit             = false;
+    rtReset                = false;
+    rtSafetyDoor           = false;
+    spindle_stop_ovr.value = 0;
+
+    // Do not clear rtAlarm because it might have been set during configuration
+    // rtAlarm = ExecAlarm::None;
 }
 
 static int32_t idleEndTime = 0;
@@ -107,60 +81,222 @@ static int32_t idleEndTime = 0;
 /*
   PRIMARY LOOP:
 */
-void protocol_main_loop() {
+static void request_safety_door() {
+    rtSafetyDoor = true;
+}
+
+TaskHandle_t outputTask = nullptr;
+
+xQueueHandle message_queue;
+
+struct LogMessage {
+    Print* channel;
+    void*  line;
+    bool   isString;
+};
+
+void drain_messages() {
+    while (uxQueueMessagesWaiting(message_queue)) {
+        vTaskDelay(1);  // Let the output task finish sending data
+    }
+}
+
+// This overload is used primarily with fixed string
+// values.  It sends a pointer to the string whose
+// memory does not need to be reclaimed later.
+// This is the most efficient form, but it only works
+// with fixed messages.
+void send_line(Print& channel, const char* line) {
+    if (outputTask) {
+        LogMessage msg { &channel, (void*)line, false };
+        while (!xQueueSend(message_queue, &msg, 10)) {}
+    } else {
+        channel.println(line);
+    }
+}
+
+// This overload is used primarily with log_*() where
+// a std::string is dynamically allocated with "new",
+// and then extended to construct the message.  Its
+// pointer is sent to the output task, which sends
+// the message to the output channel and then "delete"s
+// the pointer to reclaim the memory.
+// This form has intermediate efficiency, as the string
+// is allocated once and freed once.
+void send_line(Print& channel, const std::string* line) {
+    if (outputTask) {
+        LogMessage msg { &channel, (void*)line, true };
+        while (!xQueueSend(message_queue, &msg, 10)) {}
+    } else {
+        channel.println(line->c_str());
+        delete line;
+    }
+}
+
+// This overload is used for many miscellaneous messages
+// where the std::string is allocated in a code block and
+// then extended with various information.  This send_line()
+// copies that string to a newly allocated one and sends that
+// via the std::string* version of send_line().  The original
+// string is freed by the caller sometime after send_line()
+// returns, while the new string is freed by the output task
+// after the message is forwared to the output channel.
+// This is the least efficient form, requiring two strings
+// to be allocated and freed, with an intermediate copy.
+// It is used only rarely.
+void send_line(Print& channel, const std::string& line) {
+    if (outputTask) {
+        send_line(channel, new std::string(line));
+    } else {
+        channel.println(line.c_str());
+    }
+}
+
+void output_loop(void* unused) {
+    while (true) {
+        LogMessage message;
+        if (xQueueReceive(message_queue, &message, 0)) {
+            if (message.isString) {
+                std::string* s = static_cast<std::string*>(message.line);
+                message.channel->println(s->c_str());
+                delete s;
+            } else {
+                const char* cp = static_cast<const char*>(message.line);
+                message.channel->println(cp);
+            }
+        }
+        vTaskDelay(0);
+    }
+}
+
+Channel* activeChannel = nullptr;  // Channel associated with the input line
+
+TaskHandle_t pollingTask = nullptr;
+
+char activeLine[Channel::maxLine];
+
+bool pollingPaused = false;
+void polling_loop(void* unused) {
+    // Poll the input sources waiting for a complete line to arrive
+    for (; true; /*feedLoopWDT(), */ vTaskDelay(0)) {
+        // Polling is paused when xmodem is using a channel for binary upload
+        if (pollingPaused) {
+            vTaskDelay(100);
+            continue;
+        }
+        if (activeChannel) {
+            // Poll for realtime characters when waiting for the primary loop
+            // (in another thread) to pick up the line.
+            pollChannels();
+            continue;
+        }
+
+        // Polling without an argument both checks for realtime characters and
+        // returns a line-oriented command if one is ready.
+        activeChannel = pollChannels(activeLine);
+    }
+}
+
+void stop_polling() {
+    if (pollingTask) {
+        vTaskSuspend(pollingTask);
+    }
+}
+
+void start_polling() {
+    if (pollingTask) {
+        vTaskResume(pollingTask);
+    } else {
+        xTaskCreatePinnedToCore(polling_loop,      // task
+                                "poller",          // name for task
+                                8192,              // size of task stack
+                                0,                 // parameters
+                                1,                 // priority
+                                &pollingTask,      // task handle
+                                SUPPORT_TASK_CORE  // core
+        );
+        xTaskCreatePinnedToCore(output_loop,  // task
+                                "output",     // name for task
+                                16000,
+                                // 8192,              // size of task stack
+                                0,                 // parameters
+                                1,                 // priority
+                                &outputTask,       // task handle
+                                SUPPORT_TASK_CORE  // core
+        );
+    }
+}
+
+static void check_startup_state() {
     // Check for and report alarm state after a reset, error, or an initial power up.
     // NOTE: Sleep mode disables the stepper drivers and position can't be guaranteed.
     // Re-initialize the sleep state as an ALARM mode to ensure user homes or acknowledges.
-    if (sys.state == State::ConfigAlarm) {
-        report_feedback_message(Message::ConfigAlarmLock);
+    if (sys.state() == State::ConfigAlarm) {
+        report_error_message(Message::ConfigAlarmLock);
     } else {
         // Perform some machine checks to make sure everything is good to go.
-        if (config->_checkLimitsAtInit && config->_axes->hasHardLimits()) {
+        if (config->_start->_checkLimits && config->_axes->hasHardLimits()) {
             if (limits_get_state()) {
-                sys.state = State::Alarm;  // Ensure alarm state is active.
-                report_feedback_message(Message::CheckLimits);
+                sys.set_state(State::Alarm);  // Ensure alarm state is active.
+                report_error_message(Message::CheckLimits);
             }
         }
+        if (config->_control->startup_check()) {
+            rtAlarm = ExecAlarm::ControlPin;
+        }
 
-        if (sys.state == State::Alarm || sys.state == State::Sleep) {
+        if (sys.state() == State::Alarm || sys.state() == State::Sleep) {
             report_feedback_message(Message::AlarmLock);
-            sys.state = State::Alarm;  // Ensure alarm state is set.
+            sys.set_state(State::Alarm);  // Ensure alarm state is set.
         } else {
             // Check if the safety door is open.
-            sys.state = State::Idle;
-            if (config->_control->system_check_safety_door_ajar()) {
-                rtSafetyDoor = true;
+            sys.set_state(State::Idle);
+            while (config->_control->safety_door_ajar()) {
+                request_safety_door();
                 protocol_execute_realtime();  // Enter safety door mode. Should return as IDLE state.
             }
             // All systems go!
             settings_execute_startup();  // Execute startup script.
         }
     }
+}
+
+const uint32_t heapWarnThreshold = 15000;
+
+uint32_t heapLowWater = UINT_MAX;
+void     protocol_main_loop() {
+    check_startup_state();
+    start_polling();
 
     // ---------------------------------------------------------------------------------
     // Primary loop! Upon a system abort, this exits back to main() to reset the system.
     // This is also where the system idles while waiting for something to do.
     // ---------------------------------------------------------------------------------
-    for (;;) {
-        // Poll the input sources waiting for a complete line to arrive
-        InputClient* ic;
-        while ((ic = pollClients()) != nullptr) {
-            Print* out = ic->_out;
-            protocol_execute_realtime();  // Runtime command check point.
-            if (sys.abort) {
-                return;  // Bail to calling function upon system abort
-            }
+    for (;; vTaskDelay(0)) {
+        if (activeChannel) {
+            // The input polling task has collected a line of input
 #ifdef DEBUG_REPORT_ECHO_RAW_LINE_RECEIVED
-            report_echo_line_received(ic->_line, *out);
+            report_echo_line_received(activeLine, allChannels);
 #endif
-            // auth_level can be upgraded by supplying a password on the command line
-            report_status_message(execute_line(ic->_line, *out, WebUI::AuthenticationLevel::LEVEL_GUEST), *out);
+
+            Error status_code = execute_line(activeLine, *activeChannel, WebUI::AuthenticationLevel::LEVEL_GUEST);
+
+            // Tell the channel that the line has been processed.
+            activeChannel->ack(status_code);
+
+            // Tell the input polling task that the line has been processed,
+            // so it can give us another one when available
+            activeChannel = nullptr;
         }
-        // If there are no more lines to be processed and executed,
-        // auto-cycle start, if enabled, any queued moves.
+
+        // Auto-cycle start any queued moves.
         protocol_auto_cycle_start();
         protocol_execute_realtime();  // Runtime command check point.
-        if (sys.abort) {
+        sys.process_changes();
+
+        if (sys.abort()) {
+            stop_polling();
+
             return;  // Bail to main() program loop to reset system.
         }
 
@@ -179,6 +315,13 @@ void protocol_main_loop() {
             idleEndTime = 0;  //
             config->_axes->set_disable(true);
         }
+        uint32_t newHeapSize = xPortGetFreeHeapSize();
+        if (newHeapSize < heapLowWater) {
+            heapLowWater = newHeapSize;
+            if (heapLowWater < heapWarnThreshold) {
+                log_warn("Low memory: " << heapLowWater << " bytes");
+            }
+        }
     }
     return; /* Never reached */
 }
@@ -186,25 +329,26 @@ void protocol_main_loop() {
 // Block until all buffered steps are executed or in a cycle state. Works with feed hold
 // during a synchronize call, if it should happen. Also, waits for clean cycle end.
 void protocol_buffer_synchronize() {
-    // If system is queued, ensure cycle resumes if the auto start flag is present.
-    protocol_auto_cycle_start();
     do {
+        // Restart motion if there are blocks in the planner queue
+        protocol_auto_cycle_start();
         protocol_execute_realtime();  // Check and execute run-time commands
-        if (sys.abort) {
+        if (sys.abort()) {
             return;  // Check for system abort
         }
-    } while (plan_get_current_block() || (sys.state == State::Cycle));
+    } while (plan_get_current_block() || (sys.state() == State::Cycle));
 }
 
 // Auto-cycle start triggers when there is a motion ready to execute and if the main program is not
 // actively parsing commands.
-// NOTE: This function is called from the main loop, buffer sync, and mc_line() only and executes
+// NOTE: This function is called from the main loop, buffer sync, and mc_move_motors() only and executes
 // when one of these conditions exist respectively: There are no more blocks sent (i.e. streaming
 // is finished, single commands), a command that needs to wait for the motions in the buffer to
 // execute calls a buffer sync, or the planner buffer is full and ready to go.
 void protocol_auto_cycle_start() {
-    if (plan_get_current_block() != NULL) {  // Check if there are any blocks in the buffer.
-        rtCycleStart = true;                 // If so, execute them!
+    if (plan_get_current_block() != NULL && sys.state() != State::Cycle &&
+        sys.state() != State::Hold) {           // Check if there are any blocks in the buffer.
+        protocol_send_event(&cycleStartEvent);  // If so, execute them
     }
 }
 
@@ -221,13 +365,13 @@ void protocol_auto_cycle_start() {
 // limit switches, or the main program.
 void protocol_execute_realtime() {
     protocol_exec_rt_system();
-    if (sys.suspend.value) {
+    if (sys.suspend().value) {
         protocol_exec_rt_suspend();
     }
 }
 
 static void alarm_msg(ExecAlarm alarm_code) {
-    allClients << "ALARM:" << static_cast<int>(alarm_code) << '\n';
+    log_to(allChannels, "ALARM:", static_cast<int>(alarm_code));
     delay_ms(500);  // Force delay to ensure message clears serial write buffer.
 }
 
@@ -235,62 +379,64 @@ static void alarm_msg(ExecAlarm alarm_code) {
 // machine that controls the various real-time features.
 // NOTE: Do not alter this unless you know exactly what you are doing!
 static void protocol_do_alarm() {
-    switch (rtAlarm) {
-        case ExecAlarm::None:
-            return;
-        // System alarm. Everything has shutdown by something that has gone severely wrong. Report
-        case ExecAlarm::HardLimit:
-        case ExecAlarm::SoftLimit:
-            sys.state = State::Alarm;  // Set system alarm state
-            alarm_msg(rtAlarm);
-            report_feedback_message(Message::CriticalEvent);
-            rtReset = false;  // Disable any existing reset
-            do {
-                // Block everything, except reset and status reports, until user issues reset or power
-                // cycles. Hard limits typically occur while unattended or not paying attention. Gives
-                // the user and a GUI time to do what is needed before resetting, like killing the
-                // incoming stream. The same could be said about soft limits. While the position is not
-                // lost, continued streaming could cause a serious crash if by chance it gets executed.
-                vTaskDelay(1);  // give serial task some time
-            } while (!rtReset);
-            break;
-        default:
-            sys.state = State::Alarm;  // Set system alarm state
-            alarm_msg(rtAlarm);
-            break;
+    if (rtAlarm == ExecAlarm::None) {
+        return;
+    }
+    if (spindle->_off_on_alarm) {
+        spindle->stop();
+    }
+    sys.set_state(State::Alarm);  // Set system alarm state
+    alarm_msg(rtAlarm);
+    if (rtAlarm == ExecAlarm::HardLimit || rtAlarm == ExecAlarm::SoftLimit) {
+        report_error_message(Message::CriticalEvent);
+        protocol_disable_steppers();
+        rtReset = false;  // Disable any existing reset
+        do {
+            protocol_handle_events();
+            // Block everything except reset and status reports until user issues reset or power
+            // cycles. Hard limits typically occur while unattended or not paying attention. Gives
+            // the user and a GUI time to do what is needed before resetting, like killing the
+            // incoming stream. The same could be said about soft limits. While the position is not
+            // lost, continued streaming could cause a serious crash if by chance it gets executed.
+        } while (!rtReset);
     }
     rtAlarm = ExecAlarm::None;
 }
 
 static void protocol_start_holding() {
-    if (!(sys.suspend.bit.motionCancel || sys.suspend.bit.jogCancel)) {  // Block, if already holding.
-        Stepper::update_plan_block_parameters();                         // Notify stepper module to recompute for hold deceleration.
-        sys.step_control             = {};
+    if (!(sys.suspend().bit.motionCancel || sys.suspend().bit.jogCancel)) {  // Block, if already holding.
+        sys.step_control = {};
+        if (!Stepper::update_plan_block_parameters()) {  // Notify stepper module to recompute for hold deceleration.
+            sys.step_control.endMotion = true;
+        }
         sys.step_control.executeHold = true;  // Initiate suspend state with active flag.
     }
 }
 
 static void protocol_cancel_jogging() {
-    if (!sys.suspend.bit.motionCancel) {
-        sys.suspend.bit.jogCancel = true;
+    if (!sys.suspend().bit.motionCancel) {
+        auto suspend          = sys.suspend();
+        suspend.bit.jogCancel = true;
+        sys.set_suspend(suspend);
     }
 }
 
 static void protocol_hold_complete() {
-    sys.suspend.value            = 0;
-    sys.suspend.bit.holdComplete = true;
+    auto suspend             = sys.suspend();
+    suspend.value            = 0;
+    suspend.bit.holdComplete = true;
+    sys.set_suspend(suspend);
 }
 
 static void protocol_do_motion_cancel() {
+    // log_debug("protocol_do_motion_cancel " << state_name());
     // Execute and flag a motion cancel with deceleration and return to idle. Used primarily by probing cycle
     // to halt and cancel the remainder of the motion.
-    rtMotionCancel = false;
-    rtCycleStart   = false;  // Cancel any pending start
 
     // MOTION_CANCEL only occurs during a CYCLE, but a HOLD and SAFETY_DOOR may have been initiated
     // beforehand. Motion cancel affects only a single planner block motion, while jog cancel
     // will handle and clear multiple planner block motions.
-    switch (sys.state) {
+    switch (sys.state()) {
         case State::Alarm:
         case State::ConfigAlarm:
         case State::CheckMode:
@@ -310,20 +456,27 @@ static void protocol_do_motion_cancel() {
             // When jogging, we do not set motionCancel, hence return not break
             return;
 
+        case State::Homing:
+            // XXX maybe motion cancel should stop homing
         case State::Sleep:
         case State::Hold:
-        case State::Homing:
         case State::SafetyDoor:
             break;
     }
-    sys.suspend.bit.motionCancel = true;
+
+    auto suspend             = sys.suspend();
+    suspend.bit.motionCancel = true;
+    sys.set_suspend(suspend);
 }
 
 static void protocol_do_feedhold() {
+    if (runLimitLoop) {
+        runLimitLoop = false;  // Hack to stop show_limits()
+        return;
+    }
+    // log_debug("protocol_do_feedhold " << state_name());
     // Execute a feed hold with deceleration, if required. Then, suspend system.
-    rtFeedHold   = false;
-    rtCycleStart = false;  // Cancel any pending start
-    switch (sys.state) {
+    switch (sys.state()) {
         case State::ConfigAlarm:
         case State::Alarm:
         case State::CheckMode:
@@ -331,8 +484,11 @@ static void protocol_do_feedhold() {
         case State::Sleep:
             return;  // Do not change the state to Hold
 
-        case State::Hold:
         case State::Homing:
+            // XXX maybe feedhold should stop homing
+            log_info("Feedhold ignored while homing; use Reset instead");
+            return;
+        case State::Hold:
             break;
 
         case State::Idle:
@@ -348,17 +504,17 @@ static void protocol_do_feedhold() {
             protocol_cancel_jogging();
             return;  // Do not change the state to Hold
     }
-    sys.state = State::Hold;
+    sys.set_state(State::Hold);
 }
 
 static void protocol_do_safety_door() {
+    // log_debug("protocol_do_safety_door " << int(sys.state()));
     // Execute a safety door stop with a feed hold and disable spindle/coolant.
     // NOTE: Safety door differs from feed holds by stopping everything no matter state, disables powered
     // devices (spindle/coolant), and blocks resuming until switch is re-engaged.
 
-    rtCycleStart = false;  // Cancel any pending start
     report_feedback_message(Message::SafetyDoorAjar);
-    switch (sys.state) {
+    switch (sys.state()) {
         case State::ConfigAlarm:
             return;
         case State::Alarm:
@@ -370,23 +526,30 @@ static void protocol_do_safety_door() {
         case State::Hold:
             break;
         case State::Homing:
-            rtAlarm = ExecAlarm::HomingFailDoor;
+            Machine::Homing::fail(ExecAlarm::HomingFailDoor);
             break;
         case State::SafetyDoor:
-            if (!sys.suspend.bit.jogCancel && sys.suspend.bit.initiateRestore) {  // Actively restoring
+            if (!sys.suspend().bit.jogCancel && sys.suspend().bit.initiateRestore) {  // Actively restoring
                 // Set hold and reset appropriate control flags to restart parking sequence.
                 if (sys.step_control.executeSysMotion) {
                     Stepper::update_plan_block_parameters();  // Notify stepper module to recompute for hold deceleration.
                     sys.step_control                  = {};
                     sys.step_control.executeHold      = true;
                     sys.step_control.executeSysMotion = true;
-                    sys.suspend.bit.holdComplete      = false;
+
+                    auto suspend             = sys.suspend();
+                    suspend.bit.holdComplete = false;
+                    sys.set_suspend(suspend);
                 }  // else NO_MOTION is active.
 
-                sys.suspend.bit.retractComplete = false;
-                sys.suspend.bit.initiateRestore = false;
-                sys.suspend.bit.restoreComplete = false;
-                sys.suspend.bit.restartRetract  = true;
+                {
+                    auto suspend                = sys.suspend();
+                    suspend.bit.retractComplete = false;
+                    suspend.bit.initiateRestore = false;
+                    suspend.bit.restoreComplete = false;
+                    suspend.bit.restartRetract  = true;
+                    sys.set_suspend(suspend);
+                }
             }
             break;
         case State::Idle:
@@ -400,24 +563,31 @@ static void protocol_do_safety_door() {
             protocol_cancel_jogging();
             break;
     }
-    if (!sys.suspend.bit.jogCancel) {
+    if (!sys.suspend().bit.jogCancel) {
         // If jogging, leave the safety door event pending until the jog cancel completes
         rtSafetyDoor = false;
-        sys.state    = State::SafetyDoor;
+        sys.set_state(State::SafetyDoor);
     }
     // NOTE: This flag doesn't change when the door closes, unlike sys.state. Ensures any parking motions
     // are executed if the door switch closes and the state returns to HOLD.
-    sys.suspend.bit.safetyDoorAjar = true;
+    {
+        auto suspend               = sys.suspend();
+        suspend.bit.safetyDoorAjar = true;
+        sys.set_suspend(suspend);
+    }
 }
 
 static void protocol_do_sleep() {
-    rtSleep = false;
-    switch (sys.state) {
+    // log_debug("protocol_do_sleep " << state_name());
+    switch (sys.state()) {
         case State::ConfigAlarm:
-        case State::Alarm:
-            sys.suspend.bit.retractComplete = true;
-            sys.suspend.bit.holdComplete    = true;
+        case State::Alarm: {
+            auto suspend                = sys.suspend();
+            suspend.bit.retractComplete = true;
+            suspend.bit.holdComplete    = true;
+            sys.set_suspend(suspend);
             break;
+        }
 
         case State::Idle:
             protocol_hold_complete();
@@ -436,52 +606,73 @@ static void protocol_do_sleep() {
         case State::SafetyDoor:
             break;
     }
-    sys.state = State::Sleep;
+    sys.set_state(State::Sleep);
+}
+
+void protocol_cancel_disable_steppers() {
+    // Cancel any pending stepper disable.
+    idleEndTime = 0;
 }
 
 static void protocol_do_initiate_cycle() {
+    // log_debug("protocol_do_initiate_cycle " << state_name());
     // Start cycle only if queued motions exist in planner buffer and the motion is not canceled.
     sys.step_control = {};  // Restore step control to normal operation
-    if (plan_get_current_block() && !sys.suspend.bit.motionCancel) {
-        sys.suspend.value = 0;  // Break suspend state.
-        sys.state         = State::Cycle;
+    plan_block_t* pb;
+    if ((pb = plan_get_current_block()) && !sys.suspend().bit.motionCancel) {
+        auto suspend  = sys.suspend();
+        suspend.value = 0;  // Break suspend state.
+        sys.set_suspend(suspend);
+
+        sys.set_state(pb->is_jog ? State::Jog : State::Cycle);
         Stepper::prep_buffer();  // Initialize step segment buffer before beginning cycle.
         Stepper::wake_up();
-    } else {                    // Otherwise, do nothing. Set and resume IDLE state.
-        sys.suspend.value = 0;  // Break suspend state.
-        sys.state         = State::Idle;
+    } else {  // Otherwise, do nothing. Set and resume IDLE state.
+        auto suspend  = sys.suspend();
+        suspend.value = 0;  // Break suspend state.
+        sys.set_suspend(suspend);
+
+        sys.set_state(State::Idle);
     }
 }
+static void protocol_initiate_homing_cycle() {
+    // log_debug("protocol_initiate_homing_cycle " << state_name());
+    sys.step_control = {};  // Restore step control to normal operation
+    auto suspend     = sys.suspend();
+    suspend.value    = 0;  // Break suspend state.
+    sys.set_suspend(suspend);
+    sys.step_control.executeSysMotion = true;  // Set to execute homing motion and clear existing flags.
+    Stepper::prep_buffer();                    // Initialize step segment buffer before beginning cycle.
+    Stepper::wake_up();
+}
 
-// The handlers for rtFeedHold, rtMotionCancel, and rtsDafetyDoor clear rtCycleStart to
-// ensure that auto-cycle-start does not resume a hold without explicit user input.
 static void protocol_do_cycle_start() {
-    rtCycleStart = false;
-
+    // log_debug("protocol_do_cycle_start " << state_name());
     // Execute a cycle start by starting the stepper interrupt to begin executing the blocks in queue.
 
     // Resume door state when parking motion has retracted and door has been closed.
-    switch (sys.state) {
+    switch (sys.state()) {
         case State::SafetyDoor:
-            if (!sys.suspend.bit.safetyDoorAjar) {
-                if (sys.suspend.bit.restoreComplete) {
-                    sys.state = State::Idle;  // Set to IDLE to immediately resume the cycle.
-                } else if (sys.suspend.bit.retractComplete) {
-                    // Flag to re-energize powered components and restore original position, if disabled by SAFETY_DOOR.
-                    // NOTE: For a safety door to resume, the switch must be closed, as indicated by HOLD state, and
-                    // the retraction execution is complete, which implies the initial feed hold is not active. To
-                    // restore normal operation, the restore procedures must be initiated by the following flag. Once,
-                    // they are complete, it will call CYCLE_START automatically to resume and exit the suspend.
-                    sys.suspend.bit.initiateRestore = true;
+            if (!sys.suspend().bit.safetyDoorAjar) {
+                if (sys.suspend().bit.restoreComplete) {
+                    sys.set_state(State::Idle);
+                    protocol_do_initiate_cycle();
+                } else if (sys.suspend().bit.retractComplete) {
+                    auto suspend                = sys.suspend();
+                    suspend.bit.initiateRestore = true;
+                    sys.set_suspend(suspend);
                 }
             }
             break;
         case State::Idle:
             protocol_do_initiate_cycle();
             break;
+        case State::Homing:
+            protocol_initiate_homing_cycle();
+            break;
         case State::Hold:
             // Cycle start only when IDLE or when a hold is complete and ready to resume.
-            if (sys.suspend.bit.holdComplete) {
+            if (sys.suspend().bit.holdComplete) {
                 if (spindle_stop_ovr.value) {
                     spindle_stop_ovr.bit.restoreCycle = true;  // Set to restore in suspend routine and cycle start after.
                 } else {
@@ -494,19 +685,18 @@ static void protocol_do_cycle_start() {
         case State::CheckMode:
         case State::Sleep:
         case State::Cycle:
-        case State::Homing:
         case State::Jog:
             break;
     }
 }
 
 void protocol_disable_steppers() {
-    if (sys.state == State::Homing) {
+    if (sys.state() == State::Homing) {
         // Leave steppers enabled while homing
         config->_axes->set_disable(false);
         return;
     }
-    if (sys.state == State::Sleep || rtAlarm != ExecAlarm::None) {
+    if (sys.state() == State::Sleep || rtAlarm != ExecAlarm::None) {
         // Disable steppers immediately in sleep or alarm state
         config->_axes->set_disable(true);
         return;
@@ -529,11 +719,10 @@ void protocol_disable_steppers() {
 }
 
 void protocol_do_cycle_stop() {
-    rtCycleStop = false;
-
+    // log_debug("protocol_do_cycle_stop " << state_name());
     protocol_disable_steppers();
 
-    switch (sys.state) {
+    switch (sys.state()) {
         case State::Hold:
         case State::SafetyDoor:
         case State::Sleep:
@@ -541,13 +730,15 @@ void protocol_do_cycle_stop() {
             // realtime command execution in the main program, ensuring that the planner re-plans safely.
             // NOTE: Bresenham algorithm variables are still maintained through both the planner and stepper
             // cycle reinitializations. The stepper path should continue exactly as if nothing has happened.
-            // NOTE: rtCycleStop is set by the stepper subsystem when a cycle or feed hold completes.
-            if (!soft_limit && !sys.suspend.bit.jogCancel) {
+            // NOTE: cycleStopEvent is set by the stepper subsystem when a cycle or feed hold completes.
+            if (!soft_limit && !sys.suspend().bit.jogCancel) {
                 // Hold complete. Set to indicate ready to resume.  Remain in HOLD or DOOR states until user
                 // has issued a resume command or reset.
                 plan_cycle_reinitialize();
                 if (sys.step_control.executeHold) {
-                    sys.suspend.bit.holdComplete = true;
+                    auto suspend             = sys.suspend();
+                    suspend.bit.holdComplete = true;
+                    sys.set_suspend(suspend);
                 }
                 sys.step_control.executeHold      = false;
                 sys.step_control.executeSysMotion = false;
@@ -559,164 +750,83 @@ void protocol_do_cycle_stop() {
         case State::CheckMode:
         case State::Idle:
         case State::Cycle:
-        case State::Homing:
         case State::Jog:
             // Motion complete. Includes CYCLE/JOG/HOMING states and jog cancel/motion cancel/soft limit events.
             // NOTE: Motion and jog cancel both immediately return to idle after the hold completes.
-            if (sys.suspend.bit.jogCancel) {  // For jog cancel, flush buffers and sync positions.
+            if (sys.suspend().bit.jogCancel) {  // For jog cancel, flush buffers and sync positions.
                 sys.step_control = {};
                 plan_reset();
                 Stepper::reset();
                 gc_sync_position();
                 plan_sync_position();
             }
-            if (sys.suspend.bit.safetyDoorAjar) {  // Only occurs when safety door opens during jog.
-                sys.suspend.bit.jogCancel    = false;
-                sys.suspend.bit.holdComplete = true;
-                sys.state                    = State::SafetyDoor;
-            } else {
-                sys.suspend.value = 0;
-                sys.state         = State::Idle;
+            {
+                auto suspend = sys.suspend();
+
+                if (suspend.bit.safetyDoorAjar) {  // Only occurs when safety door opens during jog.
+                    suspend.bit.jogCancel    = false;
+                    suspend.bit.holdComplete = true;
+                    sys.set_state(State::SafetyDoor);
+                } else {
+                    suspend.value = 0;
+                    sys.set_state(State::Idle);
+                }
+
+                sys.set_suspend(suspend);
             }
+            break;
+        case State::Homing:
+            Machine::Homing::cycleStop();
             break;
     }
 }
 
-static void protocol_execute_overrides() {
-    // Execute overrides.
-    if ((rtFOverride != sys.f_override) || (rtROverride != sys.r_override)) {
-        sys.f_override     = rtFOverride;
-        sys.r_override     = rtROverride;
-        report_ovr_counter = 0;  // Set to report change immediately
-        plan_update_velocity_profile_parameters();
-        plan_cycle_reinitialize();
-    }
-
-    // NOTE: Unlike motion overrides, spindle overrides do not require a planner reinitialization.
-    if (rtSOverride != sys.spindle_speed_ovr) {
-        sys.step_control.updateSpindleSpeed = true;
-        sys.spindle_speed_ovr               = rtSOverride;
-        report_ovr_counter                  = 0;  // Set to report change immediately
-
-        // XXX this might not be necessary if the override is processed at the right level
-        // If spindle is on, tell it the RPM has been overridden
-        if (gc_state.modal.spindle != SpindleState::Disable) {
-            spindle->setState(gc_state.modal.spindle, gc_state.spindle_speed);
-            report_ovr_counter = 0;  // Set to report change immediately
-        }
-    }
-
-    if (rtAccessoryOverride.bit.spindleOvrStop) {
-        rtAccessoryOverride.bit.spindleOvrStop = false;
-        // Spindle stop override allowed only while in HOLD state.
-        if (sys.state == State::Hold) {
-            if (spindle_stop_ovr.value == 0) {
-                spindle_stop_ovr.bit.initiate = true;
-            } else if (spindle_stop_ovr.bit.enabled) {
-                spindle_stop_ovr.bit.restore = true;
-            }
-        }
-    }
-
-    // NOTE: Since coolant state always performs a planner sync whenever it changes, the current
-    // run state can be determined by checking the parser state.
-    if (rtAccessoryOverride.bit.coolantFloodOvrToggle) {
-        rtAccessoryOverride.bit.coolantFloodOvrToggle = false;
-        if (config->_coolant->hasFlood() && (sys.state == State::Idle || sys.state == State::Cycle || sys.state == State::Hold)) {
-            gc_state.modal.coolant.Flood = !gc_state.modal.coolant.Flood;
-            config->_coolant->set_state(gc_state.modal.coolant);
-            report_ovr_counter = 0;  // Set to report change immediately
-        }
-    }
-    if (rtAccessoryOverride.bit.coolantMistOvrToggle) {
-        rtAccessoryOverride.bit.coolantMistOvrToggle = false;
-
-        if (config->_coolant->hasMist() && (sys.state == State::Idle || sys.state == State::Cycle || sys.state == State::Hold)) {
-            gc_state.modal.coolant.Mist = !gc_state.modal.coolant.Mist;
-            config->_coolant->set_state(gc_state.modal.coolant);
-            report_ovr_counter = 0;  // Set to report change immediately
-        }
-    }
+static void update_velocities() {
+    report_ovr_counter = 0;  // Set to report change immediately
+    plan_update_velocity_profile_parameters();
+    plan_cycle_reinitialize();
 }
 
-void protocol_do_macro(int macro_num) {
-    // must be in Idle
-    if (sys.state != State::Idle) {
-        log_error("Macro button only permitted in idle");
-        return;
-    }
+// This is the final phase of the shutdown activity that is initiated by mc_reset().
+// The stuff herein is not necessarily safe to do in an ISR.
+static void protocol_do_late_reset() {
+    // Kill spindle and coolant.
+    spindle->stop();
+    report_ovr_counter = 0;  // Set to report change immediately
+    config->_coolant->stop();
 
-    config->_macros->run_macro(macro_num);
+    protocol_disable_steppers();
+    config->_stepping->reset();
+
+    // turn off all User I/O immediately
+    config->_userOutputs->all_off();
+
+    // do we need to stop a running file job?
+    allChannels.stopJob();
 }
 
 void protocol_exec_rt_system() {
     protocol_do_alarm();  // If there is a hard or soft limit, this will block until rtReset is set
 
     if (rtReset) {
-        if (sys.state == State::Homing) {
-            rtAlarm = ExecAlarm::HomingFailReset;
+        rtReset = false;
+        if (sys.state() == State::Homing) {
+            Machine::Homing::fail(ExecAlarm::HomingFailReset);
         }
-        // Execute system abort.
-        sys.abort = true;  // Only place this is set true.
-        return;            // Nothing else to do but exit.
-    }
-
-    if (rtStatusReport) {
-        rtStatusReport = false;
-        report_realtime_status(allClients);
-    }
-
-    if (rtMotionCancel) {
-        protocol_do_motion_cancel();
-    }
-
-    if (rtFeedHold) {
-        protocol_do_feedhold();
+        protocol_do_late_reset();
+        // Trigger system abort.
+        sys.set_abort(true);  // Only place this is set true.
+        return;               // Nothing else to do but exit.
     }
 
     if (rtSafetyDoor) {
         protocol_do_safety_door();
     }
 
-    if (rtSleep) {
-        protocol_do_sleep();
-    }
+    protocol_handle_events();
 
-    if (rtCycleStart) {
-        protocol_do_cycle_start();
-    }
-
-    if (rtCycleStop) {
-        protocol_do_cycle_stop();
-    }
-
-    if (rtButtonMacro0) {
-        rtButtonMacro0 = false;
-        protocol_do_macro(0);
-    }
-    if (rtButtonMacro1) {
-        rtButtonMacro1 = false;
-        protocol_do_macro(1);
-    }
-    if (rtButtonMacro2) {
-        rtButtonMacro0 = false;
-        protocol_do_macro(2);
-    }
-    if (rtButtonMacro3) {
-        rtButtonMacro3 = false;
-        protocol_do_macro(3);
-    }
-
-    protocol_execute_overrides();
-
-#ifdef DEBUG_PROTOCOL
-    if (rtExecDebug) {
-        rtExecDebug = false;
-        report_realtime_debug();
-    }
-#endif
     // Reload step segment buffer
-    switch (sys.state) {
+    switch (sys.state()) {
         case State::ConfigAlarm:
         case State::Alarm:
         case State::CheckMode:
@@ -733,219 +843,271 @@ void protocol_exec_rt_system() {
     }
 }
 
+static void protocol_manage_spindle() {
+    // Feed hold manager. Controls spindle stop override states.
+    // NOTE: Hold ensured as completed by condition check at the beginning of suspend routine.
+    if (spindle_stop_ovr.value) {
+        // Handles beginning of spindle stop
+        if (spindle_stop_ovr.bit.initiate) {
+            if (gc_state.modal.spindle != SpindleState::Disable) {
+                spindle->spinDown();
+                report_ovr_counter           = 0;  // Set to report change immediately
+                spindle_stop_ovr.value       = 0;
+                spindle_stop_ovr.bit.enabled = true;  // Set stop override state to enabled, if de-energized.
+            } else {
+                spindle_stop_ovr.value = 0;  // Clear stop override state
+            }
+            // Handles restoring of spindle state
+        } else if (spindle_stop_ovr.bit.restore || spindle_stop_ovr.bit.restoreCycle) {
+            if (gc_state.modal.spindle != SpindleState::Disable) {
+                report_feedback_message(Message::SpindleRestore);
+                if (spindle->isRateAdjusted()) {
+                    // When in laser mode, defer turn on until cycle starts
+                    sys.step_control.updateSpindleSpeed = true;
+                } else {
+                    config->_parking->restore_spindle();
+                    report_ovr_counter = 0;  // Set to report change immediately
+                }
+            }
+            if (spindle_stop_ovr.bit.restoreCycle) {
+                protocol_send_event(&cycleStartEvent);  // Resume program.
+            }
+            spindle_stop_ovr.value = 0;  // Clear stop override state
+        }
+    } else {
+        // Handles spindle state during hold. NOTE: Spindle speed overrides may be altered during hold state.
+        // NOTE: sys.step_control.updateSpindleSpeed is automatically reset upon resume in step generator.
+        if (sys.step_control.updateSpindleSpeed) {
+            config->_parking->restore_spindle();
+            sys.step_control.updateSpindleSpeed = false;
+        }
+    }
+}
+
 // Handles system suspend procedures, such as feed hold, safety door, and parking motion.
 // The system will enter this loop, create local variables for suspend tasks, and return to
 // whatever function that invoked the suspend, resuming normal operation.
-// This function is written in a way to promote custom parking motions. Simply use this as a
-// template
 static void protocol_exec_rt_suspend() {
-    // Declare and initialize parking local variables
-    float             restore_target[MAX_N_AXIS];
-    float             retract_waypoint = PARKING_PULLOUT_INCREMENT;
-    plan_line_data_t  plan_data;
-    plan_line_data_t* pl_data = &plan_data;
-    memset(pl_data, 0, sizeof(plan_line_data_t));
-    pl_data->motion                = {};
-    pl_data->motion.systemMotion   = 1;
-    pl_data->motion.noFeedOverride = 1;
-    pl_data->line_number           = PARKING_MOTION_LINE_NUMBER;
+    config->_parking->setup();
 
-    plan_block_t* block = plan_get_current_block();
-    CoolantState  restore_coolant;
-    SpindleState  restore_spindle;
-    SpindleSpeed  restore_spindle_speed;
-    if (block == NULL) {
-        restore_coolant       = gc_state.modal.coolant;
-        restore_spindle       = gc_state.modal.spindle;
-        restore_spindle_speed = gc_state.spindle_speed;
-    } else {
-        restore_coolant       = block->coolant;
-        restore_spindle       = block->spindle;
-        restore_spindle_speed = block->spindle_speed;
-    }
-    if (config->_disableLaserDuringHold && config->_laserMode) {
-        rtAccessoryOverride.bit.spindleOvrStop = true;
+    if (spindle->isRateAdjusted()) {
+        protocol_send_event(&accessoryOverrideEvent, (void*)AccessoryOverride::SpindleStopOvr);
     }
 
-    while (sys.suspend.value) {
-        if (sys.abort) {
+    while (sys.suspend().value) {
+        if (sys.abort()) {
             return;
         }
-        // if a jogCancel comes in and we have a jog "in-flight" (parsed and handed over to mc_line()),
+        // if a jogCancel comes in and we have a jog "in-flight" (parsed and handed over to mc_move_motors()),
         //  then we need to cancel it before it reaches the planner.  otherwise we may try to move way out of
         //  normal bounds, especially with senders that issue a series of jog commands before sending a cancel.
-        if (sys.suspend.bit.jogCancel) {
+        if (sys.suspend().bit.jogCancel) {
             mc_cancel_jog();
         }
         // Block until initial hold is complete and the machine has stopped motion.
-        if (sys.suspend.bit.holdComplete) {
+        if (sys.suspend().bit.holdComplete) {
             // Parking manager. Handles de/re-energizing, switch state checks, and parking motions for
             // the safety door and sleep states.
-            if (sys.state == State::SafetyDoor || sys.state == State::Sleep) {
+            if (sys.state() == State::SafetyDoor || sys.state() == State::Sleep) {
                 // Handles retraction motions and de-energizing.
-                float* parking_target = get_mpos();
-                if (!sys.suspend.bit.retractComplete) {
+                config->_parking->set_target();
+                if (!sys.suspend().bit.retractComplete) {
                     // Ensure any prior spindle stop override is disabled at start of safety door routine.
                     spindle_stop_ovr.value = 0;  // Disable override
 
-                    // Get current position and store restore location and spindle retract waypoint.
-                    if (!sys.suspend.bit.restartRetract) {
-                        memcpy(restore_target, parking_target, sizeof(restore_target[0]) * config->_axes->_numberAxis);
-                        retract_waypoint += restore_target[PARKING_AXIS];
-                        retract_waypoint = MIN(retract_waypoint, PARKING_TARGET);
-                    }
                     // Execute slow pull-out parking retract motion. Parking requires homing enabled, the
                     // current location not exceeding the parking target location, and laser mode disabled.
                     // NOTE: State will remain DOOR, until the de-energizing and retract is complete.
-                    if (can_park() && parking_target[PARKING_AXIS] < PARKING_TARGET) {
-                        // Retract spindle by pullout distance. Ensure retraction motion moves away from
-                        // the workpiece and waypoint motion doesn't exceed the parking target location.
-                        if (parking_target[PARKING_AXIS] < retract_waypoint) {
-                            parking_target[PARKING_AXIS] = retract_waypoint;
-                            pl_data->feed_rate           = PARKING_PULLOUT_RATE;
-                            pl_data->coolant             = restore_coolant;
-                            pl_data->spindle             = restore_spindle;
-                            pl_data->spindle_speed       = restore_spindle_speed;
-                            mc_parking_motion(parking_target, pl_data);
-                        }
-                        // NOTE: Clear accessory state after retract and after an aborted restore motion.
-                        pl_data->spindle               = SpindleState::Disable;
-                        pl_data->coolant               = {};
-                        pl_data->motion                = {};
-                        pl_data->motion.systemMotion   = 1;
-                        pl_data->motion.noFeedOverride = 1;
-                        pl_data->spindle_speed         = 0.0;
-                        spindle->spinDown();
-                        report_ovr_counter = 0;  // Set to report change immediately
-                        // Execute fast parking retract motion to parking target location.
-                        if (parking_target[PARKING_AXIS] < PARKING_TARGET) {
-                            parking_target[PARKING_AXIS] = PARKING_TARGET;
-                            pl_data->feed_rate           = PARKING_RATE;
-                            mc_parking_motion(parking_target, pl_data);
-                        }
-                    } else {
-                        // Parking motion not possible. Just disable the spindle and coolant.
-                        // NOTE: Laser mode does not start a parking motion to ensure the laser stops immediately.
-                        spindle->spinDown();
-                        config->_coolant->off();
-                        report_ovr_counter = 0;  // Set to report changes immediately
-                    }
+                    config->_parking->park(sys.suspend().bit.restartRetract);
 
-                    sys.suspend.bit.restartRetract  = false;
-                    sys.suspend.bit.retractComplete = true;
+                    auto suspend                = sys.suspend();
+                    suspend.bit.retractComplete = true;
+                    suspend.bit.restartRetract  = false;
+                    sys.set_suspend(suspend);
                 } else {
-                    if (sys.state == State::Sleep) {
+                    if (sys.state() == State::Sleep) {
                         report_feedback_message(Message::SleepMode);
                         // Spindle and coolant should already be stopped, but do it again just to be sure.
                         spindle->spinDown();
                         config->_coolant->off();
                         report_ovr_counter = 0;  // Set to report change immediately
                         Stepper::go_idle();      // Stop stepping and maybe disable steppers
-                        while (!(sys.abort)) {
+                        while (!(sys.abort())) {
                             protocol_exec_rt_system();  // Do nothing until reset.
                         }
                         return;  // Abort received. Return to re-initialize.
                     }
-                    // Allows resuming from parking/safety door. Actively checks if safety door is closed and ready to resume.
-                    if (sys.state == State::SafetyDoor) {
-                        if (!config->_control->system_check_safety_door_ajar()) {
-                            sys.suspend.bit.safetyDoorAjar = false;  // Reset door ajar flag to denote ready to resume.
+                    // Allows resuming from parking/safety door. Polls to see if safety door is closed and ready to resume.
+                    if (sys.state() == State::SafetyDoor && !config->_control->safety_door_ajar()) {
+                        if (sys.suspend().bit.safetyDoorAjar) {
+                            log_info("Safety door closed.  Issue cycle start to resume");
                         }
+                        auto suspend               = sys.suspend();
+                        suspend.bit.safetyDoorAjar = false;  // Reset door ajar flag to denote ready to resume.
+                        sys.set_suspend(suspend);
                     }
-                    // Handles parking restore and safety door resume.
-                    if (sys.suspend.bit.initiateRestore) {
-                        // Execute fast restore motion to the pull-out position. Parking requires homing enabled.
-                        // NOTE: State is will remain DOOR, until the de-energizing and retract is complete.
-                        if (can_park()) {
-                            // Check to ensure the motion doesn't move below pull-out position.
-                            if (parking_target[PARKING_AXIS] <= PARKING_TARGET) {
-                                parking_target[PARKING_AXIS] = retract_waypoint;
-                                pl_data->feed_rate           = PARKING_RATE;
-                                mc_parking_motion(parking_target, pl_data);
-                            }
-                        }
-                        // Delayed Tasks: Restart spindle and coolant, delay to power-up, then resume cycle.
-                        if (gc_state.modal.spindle != SpindleState::Disable) {
-                            // Block if safety door re-opened during prior restore actions.
-                            if (!sys.suspend.bit.restartRetract) {
-                                if (config->_laserMode) {
-                                    // When in laser mode, defer turn on until cycle starts
-                                    sys.step_control.updateSpindleSpeed = true;
-                                } else {
-                                    spindle->setState(restore_spindle, restore_spindle_speed);
-                                    report_ovr_counter = 0;  // Set to report change immediately
-                                }
-                            }
-                        }
-                        if (gc_state.modal.coolant.Flood || gc_state.modal.coolant.Mist) {
-                            // Block if safety door re-opened during prior restore actions.
-                            if (!sys.suspend.bit.restartRetract) {
-                                config->_coolant->set_state(restore_coolant);
-                                report_ovr_counter = 0;  // Set to report change immediately
-                            }
-                        }
+                    if (sys.suspend().bit.initiateRestore) {
+                        config->_parking->unpark(sys.suspend().bit.restartRetract);
 
-                        // Execute slow plunge motion from pull-out position to resume position.
-                        if (can_park()) {
-                            // Block if safety door re-opened during prior restore actions.
-                            if (!sys.suspend.bit.restartRetract) {
-                                // Regardless if the retract parking motion was a valid/safe motion or not, the
-                                // restore parking motion should logically be valid, either by returning to the
-                                // original position through valid machine space or by not moving at all.
-                                pl_data->feed_rate     = PARKING_PULLOUT_RATE;
-                                pl_data->spindle       = restore_spindle;
-                                pl_data->coolant       = restore_coolant;
-                                pl_data->spindle_speed = restore_spindle_speed;
-                                mc_parking_motion(restore_target, pl_data);
-                            }
-                        }
-                        if (!sys.suspend.bit.restartRetract) {
-                            sys.suspend.bit.restoreComplete = true;
-                            rtCycleStart                    = true;  // Set to resume program.
+                        if (!sys.suspend().bit.restartRetract && sys.state() == State::SafetyDoor && !sys.suspend().bit.safetyDoorAjar) {
+                            sys.set_state(State::Idle);
+                            protocol_send_event(&cycleStartEvent);  // Resume program.
                         }
                     }
                 }
             } else {
-                // Feed hold manager. Controls spindle stop override states.
-                // NOTE: Hold ensured as completed by condition check at the beginning of suspend routine.
-                if (spindle_stop_ovr.value) {
-                    // Handles beginning of spindle stop
-                    if (spindle_stop_ovr.bit.initiate) {
-                        if (gc_state.modal.spindle != SpindleState::Disable) {
-                            spindle->spinDown();
-                            report_ovr_counter           = 0;  // Set to report change immediately
-                            spindle_stop_ovr.value       = 0;
-                            spindle_stop_ovr.bit.enabled = true;  // Set stop override state to enabled, if de-energized.
-                        } else {
-                            spindle_stop_ovr.value = 0;  // Clear stop override state
-                        }
-                        // Handles restoring of spindle state
-                    } else if (spindle_stop_ovr.bit.restore || spindle_stop_ovr.bit.restoreCycle) {
-                        if (gc_state.modal.spindle != SpindleState::Disable) {
-                            report_feedback_message(Message::SpindleRestore);
-                            if (config->_laserMode) {
-                                // When in laser mode, defer turn on until cycle starts
-                                sys.step_control.updateSpindleSpeed = true;
-                            } else {
-                                spindle->setState(restore_spindle, restore_spindle_speed);
-                                report_ovr_counter = 0;  // Set to report change immediately
-                            }
-                        }
-                        if (spindle_stop_ovr.bit.restoreCycle) {
-                            rtCycleStart = true;  // Set to resume program.
-                        }
-                        spindle_stop_ovr.value = 0;  // Clear stop override state
-                    }
-                } else {
-                    // Handles spindle state during hold. NOTE: Spindle speed overrides may be altered during hold state.
-                    // NOTE: sys.step_control.updateSpindleSpeed is automatically reset upon resume in step generator.
-                    if (sys.step_control.updateSpindleSpeed) {
-                        spindle->setState(restore_spindle, restore_spindle_speed);
-                        sys.step_control.updateSpindleSpeed = false;
-                    }
-                }
+                protocol_manage_spindle();
             }
         }
         protocol_exec_rt_system();
+    }
+}
+
+static void protocol_do_feed_override(void* incrementvp) {
+    int increment = int(incrementvp);
+    int percent;
+    if (increment == FeedOverride::Default) {
+        percent = FeedOverride::Default;
+    } else {
+        percent = sys.f_override() + increment;
+        if (percent > FeedOverride::Max) {
+            percent = FeedOverride::Max;
+        } else if (percent < FeedOverride::Min) {
+            percent = FeedOverride::Min;
+        }
+    }
+    if (percent != sys.f_override()) {
+        sys.set_f_override(percent);
+        update_velocities();
+    }
+}
+
+static void protocol_do_rapid_override(void* percentvp) {
+    int percent = int(percentvp);
+    if (percent != sys.r_override()) {
+        sys.set_r_override(percent);
+        update_velocities();
+    }
+}
+
+static void protocol_do_spindle_override(void* incrementvp) {
+    int percent;
+    int increment = int(incrementvp);
+    if (increment == SpindleSpeedOverride::Default) {
+        percent = SpindleSpeedOverride::Default;
+    } else {
+        percent = sys.spindle_speed_ovr() + increment;
+        if (percent > SpindleSpeedOverride::Max) {
+            percent = SpindleSpeedOverride::Max;
+        } else if (percent < SpindleSpeedOverride::Min) {
+            percent = SpindleSpeedOverride::Min;
+        }
+    }
+    if (percent != sys.spindle_speed_ovr()) {
+        sys.set_spindle_speed_ovr(percent);
+        sys.step_control.updateSpindleSpeed = true;
+        report_ovr_counter                  = 0;  // Set to report change immediately
+
+        // If spindle is on, tell it the RPM has been overridden
+        // When moving, the override is handled by the stepping code
+        if (gc_state.modal.spindle != SpindleState::Disable && !inMotionState()) {
+            spindle->setState(gc_state.modal.spindle, gc_state.spindle_speed);
+            report_ovr_counter = 0;  // Set to report change immediately
+        }
+    }
+}
+
+static void protocol_do_accessory_override(void* type) {
+    switch (int(type)) {
+        case AccessoryOverride::SpindleStopOvr:
+            // Spindle stop override allowed only while in HOLD state.
+            if (sys.state() == State::Hold) {
+                if (spindle_stop_ovr.value == 0) {
+                    spindle_stop_ovr.bit.initiate = true;
+                } else if (spindle_stop_ovr.bit.enabled) {
+                    spindle_stop_ovr.bit.restore = true;
+                }
+                report_ovr_counter = 0;  // Set to report change immediately
+            }
+            break;
+        case AccessoryOverride::FloodToggle:
+            // NOTE: Since coolant state always performs a planner sync whenever it changes, the current
+            // run state can be determined by checking the parser state.
+            if (config->_coolant->hasFlood() && (sys.state() == State::Idle || sys.state() == State::Cycle || sys.state() == State::Hold)) {
+                gc_state.modal.coolant.Flood = !gc_state.modal.coolant.Flood;
+                config->_coolant->set_state(gc_state.modal.coolant);
+                report_ovr_counter = 0;  // Set to report change immediately
+            }
+            break;
+        case AccessoryOverride::MistToggle:
+            if (config->_coolant->hasMist() && (sys.state() == State::Idle || sys.state() == State::Cycle || sys.state() == State::Hold)) {
+                gc_state.modal.coolant.Mist = !gc_state.modal.coolant.Mist;
+                config->_coolant->set_state(gc_state.modal.coolant);
+                report_ovr_counter = 0;  // Set to report change immediately
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+static void protocol_do_limit(void* arg) {
+    Machine::LimitPin* limit = (Machine::LimitPin*)arg;
+    if (sys.state() == State::Homing) {
+        Machine::Homing::limitReached();
+        return;
+    }
+    log_debug("Limit switch tripped for " << config->_axes->axisName(limit->_axis) << " motor " << limit->_motorNum);
+    if (sys.state() == State::Cycle || sys.state() == State::Jog) {
+        if (limit->isHard() && rtAlarm == ExecAlarm::None) {
+            log_debug("Hard limits");
+            mc_reset();                      // Initiate system kill.
+            rtAlarm = ExecAlarm::HardLimit;  // Indicate hard limit critical event
+        }
+        return;
+    }
+}
+ArgEvent feedOverrideEvent { protocol_do_feed_override };
+ArgEvent rapidOverrideEvent { protocol_do_rapid_override };
+ArgEvent spindleOverrideEvent { protocol_do_spindle_override };
+ArgEvent accessoryOverrideEvent { protocol_do_accessory_override };
+ArgEvent limitEvent { protocol_do_limit };
+
+ArgEvent reportStatusEvent { (void (*)(void*))report_realtime_status };
+
+NoArgEvent safetyDoorEvent { request_safety_door };
+NoArgEvent feedHoldEvent { protocol_do_feedhold };
+NoArgEvent cycleStartEvent { protocol_do_cycle_start };
+NoArgEvent cycleStopEvent { protocol_do_cycle_stop };
+NoArgEvent motionCancelEvent { protocol_do_motion_cancel };
+NoArgEvent sleepEvent { protocol_do_sleep };
+NoArgEvent debugEvent { report_realtime_debug };
+
+// Only mc_reset() is permitted to set rtReset.
+NoArgEvent resetEvent { mc_reset };
+
+// The problem is that report_realtime_status needs a channel argument
+// Event statusReportEvent { protocol_do_status_report(XXX) };
+
+xQueueHandle event_queue;
+
+void protocol_init() {
+    event_queue   = xQueueCreate(10, sizeof(EventItem));
+    message_queue = xQueueCreate(10, sizeof(LogMessage));
+}
+
+void IRAM_ATTR protocol_send_event_from_ISR(Event* evt, void* arg) {
+    EventItem item { evt, arg };
+    xQueueSendFromISR(event_queue, &item, NULL);
+}
+void protocol_send_event(Event* evt, void* arg) {
+    EventItem item { evt, arg };
+    xQueueSend(event_queue, &item, 0);
+}
+void protocol_handle_events() {
+    EventItem item;
+    while (xQueueReceive(event_queue, &item, 0)) {
+        // log_debug("event");
+        item.event->run(item.arg);
     }
 }

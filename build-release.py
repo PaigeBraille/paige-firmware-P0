@@ -1,25 +1,22 @@
 #!/usr/bin/env python
 
-# Compile FluidNC for each of the radio modes
-# Add-on files are built on top of a single base.
-# This is useful for automated testing, to make sure you haven't broken something
-
-# The output is filtered so that the only lines you see are a single
-# success or failure line for each build, plus any preceding lines that
-# contain the word "error".  If you need to see everything, for example to
-# see the details of an errored build, include -v on the command line.
+# Build FluidNC release bundles (.zip files) for each host platform
 
 from shutil import copy
-from zipfile import ZipFile
-import subprocess, os, sys
+from zipfile import ZipFile, ZipInfo
+import subprocess, os, sys, shutil
 import urllib.request
 
 verbose = '-v' in sys.argv
 
 environ = dict(os.environ)
 
+def buildEmbeddedPage():
+    print('Building embedded web page')
+    return subprocess.run(["python", "build.py"], cwd="embedded").returncode
+
 def buildEnv(pioEnv, verbose=True, extraArgs=None):
-    cmd = ['platformio','run', "-e", pioEnv]
+    cmd = ['platformio','run', '--disable-auto-clean', '-e', pioEnv]
     if extraArgs:
         cmd.append(extraArgs)
     displayName = pioEnv
@@ -36,8 +33,8 @@ def buildEnv(pioEnv, verbose=True, extraArgs=None):
     print()
     return app.returncode
 
-def buildFs(pioEnv, verbose=True, extraArgs=None):
-    cmd = ['platformio','run', '-e', pioEnv, '-t', 'buildfs']
+def buildFs(pioEnv, verbose=verbose, extraArgs=None):
+    cmd = ['platformio','run', '--disable-auto-clean', '-e', pioEnv, '-t', 'buildfs']
     if extraArgs:
         cmd.append(extraArgs)
     print('Building file system for ' + pioEnv)
@@ -60,65 +57,135 @@ tag = (
 )
 
 sharedPath = 'install_scripts'
+
+def copyToZip(zipObj, platform, fileName, destPath, mode=0o100755):
+    sourcePath = os.path.join(sharedPath, platform, fileName)
+    with open(sourcePath, 'r') as f:
+        bytes = f.read()
+    info = ZipInfo.from_file(sourcePath, os.path.join(destPath, fileName))
+    info.external_attr = mode << 16
+    zipObj.writestr(info, bytes)
+
+
 relPath = os.path.join('release')
 if not os.path.exists(relPath):
     os.makedirs(relPath)
 
-zipFileName = os.path.join(relPath, 'fluidnc-' + tag + '.zip')
+# We avoid doing this every time, instead checking in a new NoFile.h as necessary
+# if buildEmbeddedPage() != 0:
+#    sys.exit(1)
 
-with ZipFile(zipFileName, 'w') as zipObj:
-    name = 'HOWTO-INSTALL.txt'
-    zipObj.write(os.path.join(sharedPath, name), name)
-    name = 'README-ESPTOOL.txt'
-    zipObj.write(os.path.join(sharedPath, name), name)
+if buildFs('wifi', verbose=verbose) != 0:
+    sys.exit(1)
 
-    numErrors = 0
+for envName in ['wifi','bt']:
+    if buildEnv(envName, verbose=verbose) != 0:
+        sys.exit(1)
+    shutil.copy(os.path.join('.pio', 'build', envName, 'firmware.elf'), os.path.join(relPath, envName + '-' + 'firmware.elf'))
 
-    pioPath = os.path.join('.pio', 'build')
+for platform in ['win64', 'posix']:
+    print("Creating zip file for ", platform)
+    terseOSName = {
+        'win64': 'win',
+        'posix': 'posix',
+    }
+    scriptExtension = {
+        'win64': '.bat',
+        'posix': '.sh',
+    }
+    exeExtension = {
+        'win64': '.exe',
+        'posix': '',
+    }
+    withEsptoolBinary = {
+        'win64': True,
+        'posix': False,
+    }
 
-    exitCode = buildFs('noradio', verbose=verbose)
-    if exitCode != 0:
-        numErrors += 1
-    else:
-        # Put common/spiffs.bin in the archive
-        obj = 'spiffs.bin'
-        zipObj.write(os.path.join(pioPath, 'noradio', obj), os.path.join('common', obj))
-        tools = os.path.join(os.path.expanduser('~'),'.platformio','packages','framework-arduinoespressif32','tools')
-        bootloader = 'bootloader_dio_80m.bin'
-        zipObj.write(os.path.join(tools, 'sdk', 'bin', bootloader), os.path.join('common', bootloader))
+    zipDirName = os.path.join('fluidnc-' + tag + '-' + platform)
+    zipFileName = os.path.join(relPath, zipDirName + '.zip')
+
+    with ZipFile(zipFileName, 'w') as zipObj:
+        name = 'HOWTO-INSTALL.txt'
+        zipObj.write(os.path.join(sharedPath, platform, name), os.path.join(zipDirName, name))
+
+        pioPath = os.path.join('.pio', 'build')
+
+        # Put boot_app binary in the archive
         bootapp = 'boot_app0.bin';
-        zipObj.write(os.path.join(tools, "partitions", bootapp), os.path.join('common', bootapp))
+        tools = os.path.join(os.path.expanduser('~'),'.platformio','packages','framework-arduinoespressif32','tools')
+        zipObj.write(os.path.join(tools, "partitions", bootapp), os.path.join(zipDirName, 'common', bootapp))
+        for secFuses in ['SecurityFusesOK.bin', 'SecurityFusesOK0.bin']:
+            zipObj.write(os.path.join(sharedPath, 'common', secFuses), os.path.join(zipDirName, 'common', secFuses))
 
-        for envName in ['wifi','bt','wifibt','noradio']:
-            exitCode = buildEnv(envName, verbose=verbose)
-            if exitCode != 0:
-                numErrors += 1
-            else:
-                objPath = os.path.join(pioPath, envName)
-                for obj in ['firmware.bin','partitions.bin']:
-                    zipObj.write(os.path.join(objPath, obj), os.path.join(envName, obj))
-                for obj in ['install-win.bat','install-linux.sh','install-macos.sh']:
-                    zipObj.write(os.path.join(sharedPath, obj), os.path.join(envName, obj))
+        # Put FluidNC binaries, partition maps, and installers in the archive
+        for envName in ['wifi','bt']:
+
+            # Put bootloader binaries in the archive
+            bootloader = 'bootloader.bin'
+            zipObj.write(os.path.join(pioPath, envName, bootloader), os.path.join(zipDirName, envName, bootloader))
+
+            # Put littlefs.bin and index.html.gz in the archive
+            # bt does not need a littlefs.bin because there is no use for index.html.gz
+            if envName == 'wifi':
+                name = 'littlefs.bin'
+                zipObj.write(os.path.join(pioPath, envName, name), os.path.join(zipDirName, envName, name))
+                name = 'index.html.gz'
+                zipObj.write(os.path.join('FluidNC', 'data', name), os.path.join(zipDirName, envName, name))
+
+            objPath = os.path.join(pioPath, envName)
+            for obj in ['firmware.bin','partitions.bin']:
+                zipObj.write(os.path.join(objPath, obj), os.path.join(zipDirName, envName, obj))
+
+            # E.g. posix/install-wifi.sh -> install-wifi.sh
+            copyToZip(zipObj, platform, 'install-' + envName + scriptExtension[platform], zipDirName)
+
+        for script in ['install-fs', 'fluidterm', 'checksecurity', 'erase', 'tools']:
+            # E.g. posix/fluidterm.sh -> fluidterm.sh
+            copyToZip(zipObj, platform, script + scriptExtension[platform], zipDirName)
+
+        # Put the fluidterm code in the archive
+        for obj in ['fluidterm.py', 'README-FluidTerm.md']:
+            fn = os.path.join('fluidterm', obj)
+            zipObj.write(fn, os.path.join(zipDirName, os.path.join('common', obj)))
+
+        if platform == 'win64':
+            obj = 'fluidterm' + exeExtension[platform]
+            zipObj.write(os.path.join('fluidterm', obj), os.path.join(zipDirName, platform, obj))
+
         EsptoolVersion = 'v3.1'
-        EspRepo = 'https://github.com/espressif/esptool/releases/download/' + EsptoolVersion + '/'
 
-        for platform in ['win64', 'macos', 'linux-amd64']:
+        # Put esptool and related tools in the archive
+        if withEsptoolBinary[platform]:
+            name = 'README-ESPTOOL.txt'
+            EspRepo = 'https://github.com/espressif/esptool/releases/download/' + EsptoolVersion + '/'
             EspDir = 'esptool-' + EsptoolVersion + '-' + platform
-            # Download and unzip from es
-            ZipFileName = EspDir + '.zip'
+            zipObj.write(os.path.join(sharedPath, platform, name), os.path.join(zipDirName, platform,
+                         name.replace('.txt', '-' + EsptoolVersion + '.txt')))
+        else:
+            name = 'README-ESPTOOL-SOURCE.txt'
+            EspRepo = 'https://github.com/espressif/esptool/archive/refs/tags/'
+            EspDir = EsptoolVersion
+            zipObj.write(os.path.join(sharedPath, 'common', name), os.path.join(zipDirName, 'common',
+                         name.replace('.txt', '-' + EsptoolVersion + '.txt')))
 
-            if not os.path.isfile(ZipFileName):
-                print('Downloading ' + EspRepo + ZipFileName)
-                with urllib.request.urlopen(EspRepo + ZipFileName) as u:
-                    open(ZipFileName, 'wb').write(u.read())
 
-            if platform == 'win64':
-                Binary = 'esptool.exe'
-            else:
-                Binary = 'esptool'
-            Path = EspDir + '/' + Binary
-            with ZipFile(ZipFileName, 'r') as zipReader:
-                zipObj.writestr(os.path.join(platform, Binary), zipReader.read(Path))
+        # Download and unzip from ESP repo
+        ZipFileName = EspDir + '.zip'
+        if not os.path.isfile(ZipFileName):
+            with urllib.request.urlopen(EspRepo + ZipFileName) as u:
+                open(ZipFileName, 'wb').write(u.read())
 
-sys.exit(numErrors)
+        if withEsptoolBinary[platform]:
+            for Binary in ['esptool']:
+                Binary += exeExtension[platform]
+                sourceFileName = EspDir + '/' + Binary
+                with ZipFile(ZipFileName, 'r') as zipReader:
+                    destFileName = os.path.join(zipDirName, platform, Binary)
+                    info = ZipInfo(destFileName)
+                    info.external_attr = 0o100755 << 16
+                    zipObj.writestr(info, zipReader.read(sourceFileName))
+        else:
+            zipObj.write(os.path.join(ZipFileName), os.path.join(zipDirName, 'common', 'esptool-source.zip'))
 
+sys.exit(0)

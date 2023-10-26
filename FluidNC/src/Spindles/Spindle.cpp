@@ -14,7 +14,7 @@ Spindles::Spindle* spindle = nullptr;
 namespace Spindles {
     // ========================= Spindle ==================================
 
-    void Spindle::switchSpindle(uint8_t new_tool, SpindleList spindles, Spindle*& spindle) {
+    void Spindle::switchSpindle(uint32_t new_tool, SpindleList spindles, Spindle*& spindle) {
         // Find the spindle whose tool number is closest to and below the new tool number
         Spindle* candidate = nullptr;
         for (auto s : spindles) {
@@ -68,7 +68,7 @@ namespace Spindles {
             scale *= max_dev_speed;
 
             // float scale = deltaPercent * max_dev_speed;
-            scaler           = uint32_t(scale * 65536);
+            scaler           = uint32_t(scale * 65536);  //  computation is done in fixed point with 16 fractional bits.
             _speeds[i].scale = scaler;
         }
 
@@ -79,7 +79,12 @@ namespace Spindles {
         _speeds[i].scale  = scaler;
     }
 
-    void Spindle::afterParse() {}
+    void Spindle::afterParse() {
+        if (_speeds.size() && !maxSpeed()) {
+            log_error("Speed map max speed is 0. Using default");
+            _speeds.clear();
+        }
+    }
 
     void Spindle::linearSpeeds(SpindleSpeed maxSpeed, float maxPercent) {
         _speeds.clear();
@@ -98,9 +103,12 @@ namespace Spindles {
         _speeds.push_back({ max, 100.0f });
     }
 
-    uint32_t Spindle::mapSpeed(SpindleSpeed speed) {
-        speed             = speed * sys.spindle_speed_ovr / 100;
-        sys.spindle_speed = speed;
+    uint32_t IRAM_ATTR Spindle::mapSpeed(SpindleSpeed speed) {
+        if (_speeds.size() == 0) {
+            return 0;
+        }
+        speed = speed * sys.spindle_speed_ovr() / 100;
+        sys.set_spindle_speed(speed);
         if (speed < _speeds[0].speed) {
             return _speeds[0].offset;
         }
@@ -123,7 +131,7 @@ namespace Spindles {
         // Otherwise, we interpolate by applying the segment scale factor
         // to the segment offset .
         if (i < num_segments) {
-            dev_speed += (((speed - _speeds[i].speed) * _speeds[i].scale) >> 16);
+            dev_speed += uint32_t((((speed - _speeds[i].speed) * uint64_t(_speeds[i].scale)) >> 16));
         }
 
         // log_debug("rpm " << speed << " speed " << dev_speed); // This will spew quite a bit of data on your output
@@ -190,10 +198,10 @@ namespace Spindles {
                 }
         }
         if (down) {
-            delay(_spindown_ms * down / maxSpeed());
+            delay(down < maxSpeed() ? _spindown_ms * down / maxSpeed() : _spindown_ms);
         }
         if (up) {
-            delay(_spinup_ms * up / maxSpeed());
+            delay(up < maxSpeed() ? _spinup_ms * up / maxSpeed() : _spinup_ms);
         }
         _current_state = state;
         _current_speed = speed;

@@ -29,6 +29,7 @@ enum class Error : uint8_t {
     InvalidJogCommand           = 16,
     SettingDisabledLaser        = 17,
     HomingNoCycles              = 18,
+    SingleAxisHoming            = 19,
     GcodeUnsupportedCommand     = 20,
     GcodeModalGroupViolation    = 21,
     GcodeUndefinedFeedRate      = 22,
@@ -49,21 +50,21 @@ enum class Error : uint8_t {
     GcodeG43DynamicAxisError    = 37,
     GcodeMaxValueExceeded       = 38,
     PParamMaxExceeded           = 39,
-    FsFailedMount               = 60,  // SD Failed to mount
-    FsFailedRead                = 61,  // SD Failed to read file
-    FsFailedOpenDir             = 62,  // SD card failed to open directory
-    FsDirNotFound               = 63,  // SD Card directory not found
-    FsFileEmpty                 = 64,  // SD Card directory not found
-    FsFileNotFound              = 65,  // SD Card file not found
-    FsFailedOpenFile            = 66,  // SD card failed to open file
-    FsFailedBusy                = 67,  // SD card is busy
+    CheckControlPins            = 40,
+    FsFailedMount               = 60,  // Filesystem failed to mount
+    FsFailedRead                = 61,  // Failed to read file
+    FsFailedOpenDir             = 62,  // Failed to open directory
+    FsDirNotFound               = 63,  // Directory not found
+    FsFileEmpty                 = 64,  // File is empty
+    FsFileNotFound              = 65,  // File not found
+    FsFailedOpenFile            = 66,  // Failed to open file
+    FsFailedBusy                = 67,  // Filesystem is busy
     FsFailedDelDir              = 68,
     FsFailedDelFile             = 69,
-    BtFailBegin                 = 70,  // Bluetooth failed to start
-    WifiFailBegin               = 71,  // WiFi failed to start
     NumberRange                 = 80,  // Setting number range problem
     InvalidValue                = 81,  // Setting string problem
     FsFailedCreateFile          = 82,
+    FsFailedFormat              = 83,
     MessageFailed               = 90,
     NvsSetFailed                = 100,
     NvsGetStatsFailed           = 101,
@@ -75,6 +76,8 @@ enum class Error : uint8_t {
     BadPinSpecification         = 150,
     BadRuntimeConfigSetting     = 151,
     ConfigurationInvalid        = 152,
+    UploadFailed                = 160,
+    DownloadFailed              = 161,
 };
 
 const char* errorString(Error errorNumber);

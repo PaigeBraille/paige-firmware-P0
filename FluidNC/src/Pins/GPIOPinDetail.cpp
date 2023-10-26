@@ -3,20 +3,52 @@
 
 #include <esp_attr.h>  // IRAM_ATTR
 #include <esp32-hal-gpio.h>
+#include "Driver/fluidnc_gpio.h"
 #include <stdexcept>
 
 #include "GPIOPinDetail.h"
 #include "../Assert.h"
-#include "../Logging.h"
-
-extern "C" void __pinMode(pinnum_t pin, uint8_t mode);
-extern "C" int  __digitalRead(pinnum_t pin);
-extern "C" void __digitalWrite(pinnum_t pin, uint8_t val);
+#include "../Config.h"
 
 namespace Pins {
     std::vector<bool> GPIOPinDetail::_claimed(nGPIOPins, false);
 
     PinCapabilities GPIOPinDetail::GetDefaultCapabilities(pinnum_t index) {
+#ifdef CONFIG_IDF_TARGET_ESP32S3
+        if ((index >= 0 && index <= 21) || (index >= 35 && index <= 48)) {
+            return PinCapabilities::Native | PinCapabilities::Input | PinCapabilities::Output | PinCapabilities::PullUp |
+                   PinCapabilities::PullDown | PinCapabilities::PWM | PinCapabilities::ISR | PinCapabilities::UART |
+                   (index <= 20 ? PinCapabilities::ADC : PinCapabilities::None);
+        } else {
+            // Not mapped to actual GPIO pins
+            return PinCapabilities::None;
+        }
+
+#elif CONFIG_IDF_TARGET_ESP32S2
+        switch (index) {
+            case 43:  // TX pin of Serial0. Note that Serial0 also runs through the Pins framework!
+                return PinCapabilities::Native | PinCapabilities::Output | PinCapabilities::Input | PinCapabilities::UART |
+                       PinCapabilities::ADC;
+
+            case 44:  // RX pin of Serial0. Note that Serial0 also runs through the Pins framework!
+                return PinCapabilities::Native | PinCapabilities::Output | PinCapabilities::Input | PinCapabilities::ISR |
+                       PinCapabilities::UART | PinCapabilities::ADC;
+
+            case 46:
+                return PinCapabilities::Native | PinCapabilities::Input | PinCapabilities::ADC | PinCapabilities::ISR | PinCapabilities::UART;
+
+            default:
+                if ((index >= 0 && index <= 21) || index == 26 || (index >= 33 && index <= 45)) {
+                    return PinCapabilities::Native | PinCapabilities::Input | PinCapabilities::Output | PinCapabilities::PullUp |
+                           PinCapabilities::PullDown | PinCapabilities::PWM | PinCapabilities::ISR | PinCapabilities::UART |
+                           (index <= 20 ? PinCapabilities::ADC : PinCapabilities::None);
+                } else {
+                    // Not mapped to actual GPIO pins
+                    return PinCapabilities::None;
+                }
+        }
+
+#else
         // See https://randomnerdtutorials.com/esp32-pinout-reference-gpios/ for an overview:
         switch (index) {
             case 0:  // Outputs PWM signal at boot
@@ -68,8 +100,7 @@ namespace Pins {
             case 9:
             case 10:
             case 11:
-                return PinCapabilities::Native | PinCapabilities::Input | PinCapabilities::Output | PinCapabilities::PWM |
-                       PinCapabilities::ISR | PinCapabilities::UART;
+                return PinCapabilities::Reserved;
 
             case 34:  // Input only pins
             case 35:
@@ -81,6 +112,7 @@ namespace Pins {
             default:  // Not mapped to actual GPIO pins
                 return PinCapabilities::None;
         }
+#endif
     }
 
     GPIOPinDetail::GPIOPinDetail(pinnum_t index, PinOptionsParser options) :
@@ -92,17 +124,25 @@ namespace Pins {
         // WILL get into trouble.
 
         Assert(index < nGPIOPins, "Pin number is greater than max %d", nGPIOPins - 1);
+        Assert(_capabilities != PinCapabilities::Reserved, "Unusable GPIO");
         Assert(_capabilities != PinCapabilities::None, "Unavailable GPIO");
         Assert(!_claimed[index], "Pin is already used.");
 
         // User defined pin capabilities
         for (auto opt : options) {
             if (opt.is("pu")) {
-                Assert(_capabilities.has(PinCapabilities::PullUp), "Pin %s does not support :pu", toString().c_str());
-                _attributes = _attributes | PinAttributes::PullUp;
+                if (_capabilities.has(PinCapabilities::PullUp)) {
+                    _attributes = _attributes | PinAttributes::PullUp;
+                } else {
+                    log_warn(toString() << " does not support :pu attribute");
+                }
+
             } else if (opt.is("pd")) {
-                Assert(_capabilities.has(PinCapabilities::PullDown), "Pin %s does not support :pd", toString().c_str());
-                _attributes = _attributes | PinAttributes::PullDown;
+                if (_capabilities.has(PinCapabilities::PullDown)) {
+                    _attributes = _attributes | PinAttributes::PullDown;
+                } else {
+                    log_warn(toString() << " does not support :pd attribute");
+                }
             } else if (opt.is("low")) {
                 _attributes = _attributes | PinAttributes::ActiveLow;
             } else if (opt.is("high")) {
@@ -122,15 +162,18 @@ namespace Pins {
     PinCapabilities GPIOPinDetail::capabilities() const { return _capabilities; }
 
     void IRAM_ATTR GPIOPinDetail::write(int high) {
-        if (!_attributes.has(PinAttributes::Output)) {
-            log_error(toString());
+        if (high != _lastWrittenValue) {
+            _lastWrittenValue = high;
+            if (!_attributes.has(PinAttributes::Output)) {
+                log_error(toString());
+            }
+            Assert(_attributes.has(PinAttributes::Output), "Pin %s cannot be written", toString().c_str());
+            int value = _readWriteMask ^ high;
+            gpio_write(_index, value);
         }
-        Assert(_attributes.has(PinAttributes::Output), "Pin %s cannot be written", toString().c_str());
-        int value = _readWriteMask ^ high;
-        __digitalWrite(_index, value);
     }
     int IRAM_ATTR GPIOPinDetail::read() {
-        auto raw = __digitalRead(_index);
+        auto raw = gpio_read(_index);
         return raw ^ _readWriteMask;
     }
 
@@ -149,42 +192,35 @@ namespace Pins {
 
         _attributes = _attributes | value;
 
-        // Handle attributes:
-        uint8_t pinModeValue = 0;
-
-        if (value.has(PinAttributes::Input)) {
-            pinModeValue |= INPUT;
-        } else if (value.has(PinAttributes::Output)) {
-            pinModeValue |= OUTPUT;
-        }
-
-        // PU/PD should be specified by the user. Code has nothing to do with them:
-        if (_attributes.has(PinAttributes::PullUp)) {
-            pinModeValue |= PULLUP;
-        } else if (_attributes.has(PinAttributes::PullDown)) {
-            pinModeValue |= PULLDOWN;
-        }
-
         // If the pin is ActiveLow, we should take that into account here:
         if (value.has(PinAttributes::Output)) {
-            __digitalWrite(_index, int(value.has(PinAttributes::InitialOn)) ^ _readWriteMask);
+            gpio_write(_index, int(value.has(PinAttributes::InitialOn)) ^ _readWriteMask);
         }
 
-        __pinMode(_index, pinModeValue);
+        gpio_mode(_index,
+                  value.has(PinAttributes::Input),
+                  value.has(PinAttributes::Output),
+                  _attributes.has(PinAttributes::PullUp),
+                  _attributes.has(PinAttributes::PullDown),
+                  false);  // We do not have an OpenDrain attribute yet
     }
 
-    void GPIOPinDetail::attachInterrupt(void (*callback)(void*), void* arg, int mode) {
+    void GPIOPinDetail::attachInterrupt(void (*callback)(void*, bool), void* arg, int mode) {
         Assert(_attributes.has(PinAttributes::ISR), "Pin %s does not support interrupts", toString().c_str());
-        ::attachInterruptArg(_index, callback, arg, mode);
+
+        // ::attachInterruptArg(_index, callback, arg, mode);
+        gpio_set_action(_index, callback, arg, _attributes.has(PinAttributes::ActiveLow));
     }
 
     void GPIOPinDetail::detachInterrupt() {
         Assert(_attributes.has(PinAttributes::ISR), "Pin %s does not support interrupts");
-        ::detachInterrupt(_index);
+        // ::detachInterrupt(_index);
+        gpio_clear_action(_index);
     }
 
-    String GPIOPinDetail::toString() {
-        auto s = String("gpio.") + int(_index);
+    std::string GPIOPinDetail::toString() {
+        std::string s("gpio.");
+        s += std::to_string(_index);
         if (_attributes.has(PinAttributes::ActiveLow)) {
             s += ":low";
         }

@@ -2,7 +2,7 @@
 
 #include "WebUI/JSONEncoder.h"
 #include "WebUI/Authentication.h"
-#include "Report.h"  // info_client
+#include "Report.h"  // info_channel
 #include "GCode.h"   // CoordIndex
 
 #include <map>
@@ -92,7 +92,7 @@ public:
     // Derived classes may override it to do something.
     virtual void addWebui(WebUI::JSONencoder*) {};
 
-    virtual Error action(char* value, WebUI::AuthenticationLevel auth_level, Print& out) = 0;
+    virtual Error action(char* value, WebUI::AuthenticationLevel auth_level, Channel& out) = 0;
 };
 
 class Setting : public Word {
@@ -113,7 +113,7 @@ public:
 
     Error check(char* s);
 
-    static Error report_nvs_stats(const char* value, WebUI::AuthenticationLevel auth_level, Print& out) {
+    static Error report_nvs_stats(const char* value, WebUI::AuthenticationLevel auth_level, Channel& out) {
         nvs_stats_t stats;
         if (esp_err_t err = nvs_get_stats(NULL, &stats)) {
             return Error::NvsGetStatsFailed;
@@ -132,7 +132,7 @@ public:
         return Error::Ok;
     }
 
-    static Error eraseNVS(const char* value, WebUI::AuthenticationLevel auth_level, Print& out) {
+    static Error eraseNVS(const char* value, WebUI::AuthenticationLevel auth_level, Channel& out) {
         nvs_erase_all(_handle);
         return Error::Ok;
     }
@@ -154,8 +154,7 @@ public:
     virtual void addWebui(WebUI::JSONencoder*) {};
 
     virtual Error       setStringValue(char* value) = 0;
-    Error               setStringValue(String s) { return setStringValue(s.c_str()); }
-    virtual const char* getStringValue() = 0;
+    virtual const char* getStringValue()            = 0;
     virtual const char* getCompatibleValue() { return getStringValue(); }
     virtual const char* getDefaultString() = 0;
 };
@@ -229,12 +228,12 @@ extern Coordinates* coords[CoordIndex::End];
 
 class StringSetting : public Setting {
 private:
-    String _defaultValue;
-    String _currentValue;
-    String _storedValue;
-    int    _minLength;
-    int    _maxLength;
-    void   _setStoredValue(const char* s);
+    std::string _defaultValue;
+    std::string _currentValue;
+    std::string _storedValue;
+    int         _minLength;
+    int         _maxLength;
+    void        _setStoredValue(const char* s);
 
 public:
     StringSetting(const char*   description,
@@ -298,18 +297,51 @@ public:
     Error       setStringValue(char* value);
     const char* getStringValue();
     const char* getDefaultString();
+    void        showList();
 
     int8_t get() { return _currentValue; }
 };
 
-extern bool idleOrJog();
-extern bool idleOrAlarm();
+extern bool notIdleOrJog();
+extern bool notIdleOrAlarm();
 extern bool anyState();
-extern bool notCycleOrHold();
+extern bool cycleOrHold();
+
+class IPaddrSetting : public Setting {
+private:
+    uint32_t _defaultValue;
+    uint32_t _currentValue;
+    uint32_t _storedValue;
+
+public:
+    IPaddrSetting(const char*   description,
+                  type_t        type,
+                  permissions_t permissions,
+                  const char*   grblName,
+                  const char*   name,
+                  uint32_t      defVal,
+                  bool (*checker)(char*));
+    IPaddrSetting(const char*   description,
+                  type_t        type,
+                  permissions_t permissions,
+                  const char*   grblName,
+                  const char*   name,
+                  const char*   defVal,
+                  bool (*checker)(char*));
+
+    void        load();
+    void        setDefault();
+    void        addWebui(WebUI::JSONencoder*);
+    Error       setStringValue(char* value);
+    const char* getStringValue();
+    const char* getDefaultString();
+
+    uint32_t get() { return _currentValue; }
+};
 
 class WebCommand : public Command {
 private:
-    Error (*_action)(char*, WebUI::AuthenticationLevel);
+    Error (*_action)(char*, WebUI::AuthenticationLevel, Channel& out);
     const char* password;
 
 public:
@@ -318,42 +350,34 @@ public:
                permissions_t permissions,
                const char*   grblName,
                const char*   name,
-               Error (*action)(char*, WebUI::AuthenticationLevel),
-               bool (*cmdChecker)()) :
+               Error (*action)(char*, WebUI::AuthenticationLevel, Channel& out),
+               bool (*cmdChecker)() = notIdleOrAlarm) :
         Command(description, type, permissions, grblName, name, cmdChecker),
         _action(action) {}
 
-    WebCommand(const char*   description,
-               type_t        type,
-               permissions_t permissions,
-               const char*   grblName,
-               const char*   name,
-               Error (*action)(char*, WebUI::AuthenticationLevel)) :
-        WebCommand(description, type, permissions, grblName, name, action, idleOrAlarm) {}
-
-    Error action(char* value, WebUI::AuthenticationLevel auth_level, Print& response);
+    Error action(char* value, WebUI::AuthenticationLevel auth_level, Channel& out);
 };
 
 class UserCommand : public Command {
 private:
-    Error (*_action)(const char*, WebUI::AuthenticationLevel, Print&);
+    Error (*_action)(const char*, WebUI::AuthenticationLevel, Channel&);
 
 public:
     UserCommand(const char* grblName,
                 const char* name,
-                Error (*action)(const char*, WebUI::AuthenticationLevel, Print&),
+                Error (*action)(const char*, WebUI::AuthenticationLevel, Channel&),
                 bool (*cmdChecker)(),
-                permissions_t auth) :
+                permissions_t auth = WG) :
         Command(NULL, GRBLCMD, auth, grblName, name, cmdChecker),
         _action(action) {}
 
-    UserCommand(const char* grblName, const char* name, Error (*action)(const char*, WebUI::AuthenticationLevel, Print&), bool (*cmdChecker)()) :
-        UserCommand(grblName, name, action, cmdChecker, WG) {}
-    Error action(char* value, WebUI::AuthenticationLevel auth_level, Print& response);
+    Error action(char* value, WebUI::AuthenticationLevel auth_level, Channel& response);
 };
 
 // Execute the startup script lines stored in non-volatile storage upon initialization
 void  settings_execute_startup();
-Error settings_execute_line(char* line, Print& out, WebUI::AuthenticationLevel);
-Error do_command_or_setting(const char* key, char* value, WebUI::AuthenticationLevel auth_level, Print&);
-Error execute_line(char* line, Print& client, WebUI::AuthenticationLevel auth_level);
+Error settings_execute_line(char* line, Channel& out, WebUI::AuthenticationLevel);
+Error do_command_or_setting(const char* key, char* value, WebUI::AuthenticationLevel auth_level, Channel&);
+Error execute_line(char* line, Channel& channel, WebUI::AuthenticationLevel auth_level);
+
+extern enum_opt_t onoffOptions;

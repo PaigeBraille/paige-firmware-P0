@@ -2,11 +2,13 @@
 
 #include "../Motors/MotorDriver.h"
 #include "../Motors/NullMotor.h"
-#include "../NutsBolts.h"
+#include "../Config.h"
 #include "../MotionControl.h"
 #include "../Stepper.h"     // stepper_id_t
 #include "MachineConfig.h"  // config->
 #include "../Limits.h"
+
+EnumItem axisType[] = { { 0, "X" }, { 1, "Y" }, { 2, "Z" }, { 3, "A" }, { 4, "B" }, { 5, "C" }, EnumItem(0) };
 
 namespace Machine {
     MotorMask Axes::posLimitMask = 0;
@@ -29,7 +31,11 @@ namespace Machine {
             _sharedStepperDisable.report("Shared stepper disable");
         }
 
-        unlock_all_motors();
+        if (_sharedStepperReset.defined()) {
+            _sharedStepperReset.setAttr(Pin::Attr::Output | Pin::Attr::InitialOn);
+            _sharedStepperReset.on();
+            _sharedStepperReset.report("Shared stepper reset");
+        }
 
         // certain motors need features to be turned on. Check them here
         for (size_t axis = X_AXIS; axis < _numberAxis; axis++) {
@@ -39,6 +45,8 @@ namespace Machine {
                 a->init();
             }
         }
+
+        config_motors();
     }
 
     void IRAM_ATTR Axes::set_disable(int axis, bool disable) {
@@ -61,7 +69,6 @@ namespace Machine {
     // Put the motors in the given axes into homing mode, returning a
     // mask of which motors can do homing.
     MotorMask Axes::set_homing_mode(AxisMask axisMask, bool isHoming) {
-        unlock_all_motors();  // On homing transitions, cancel all motor lockouts
         MotorMask motorsCanHome = 0;
 
         for (size_t axis = X_AXIS; axis < _numberAxis; axis++) {
@@ -70,8 +77,11 @@ namespace Machine {
                 if (a != nullptr) {
                     for (size_t motor = 0; motor < Axis::MAX_MOTORS_PER_AXIS; motor++) {
                         auto m = _axis[axis]->_motors[motor];
-                        if (m && m->_driver->set_homing_mode(isHoming)) {
-                            set_bitnum(motorsCanHome, motor * 16 + axis);
+                        if (m) {
+                            m->unblock();
+                            if (m->_driver->set_homing_mode(isHoming)) {
+                                set_bitnum(motorsCanHome, motor_bit(axis, motor));
+                            }
                         }
                     }
                 }
@@ -80,10 +90,6 @@ namespace Machine {
 
         return motorsCanHome;
     }
-
-    void Axes::unlock_all_motors() { _motorLockoutMask = 0; }
-    void Axes::lock_motors(MotorMask mask) { set_bits(_motorLockoutMask, mask); }
-    void Axes::unlock_motors(MotorMask mask) { clear_bits(_motorLockoutMask, mask); }
 
     void IRAM_ATTR Axes::step(uint8_t step_mask, uint8_t dir_mask) {
         auto n_axis = _numberAxis;
@@ -111,18 +117,13 @@ namespace Machine {
         // Turn on step pulses for motors that are supposed to step now
         for (size_t axis = X_AXIS; axis < n_axis; axis++) {
             if (bitnum_is_true(step_mask, axis)) {
-                auto a = _axis[axis];
+                bool dir = bitnum_is_true(dir_mask, axis);
 
-                if (bitnum_is_false(_motorLockoutMask, axis)) {
-                    auto m = a->_motors[0];
+                auto a = _axis[axis];
+                for (size_t motor = 0; motor < Axis::MAX_MOTORS_PER_AXIS; motor++) {
+                    auto m = a->_motors[motor];
                     if (m) {
-                        m->_driver->step();
-                    }
-                }
-                if (bitnum_is_false(_motorLockoutMask, axis + 16)) {
-                    auto m = a->_motors[1];
-                    if (m) {
-                        m->_driver->step();
+                        m->step(dir);
                     }
                 }
             }
@@ -144,6 +145,12 @@ namespace Machine {
         }
 
         config->_stepping->finishPulse();
+    }
+
+    void Axes::config_motors() {
+        for (int axis = 0; axis < _numberAxis; ++axis) {
+            _axis[axis]->config_motors();
+        }
     }
 
     // Some small helpers to find the axis index and axis motor index for a given motor. This
@@ -180,7 +187,8 @@ namespace Machine {
     // Configuration helpers:
 
     void Axes::group(Configuration::HandlerBase& handler) {
-        handler.item("shared_stepper_disable", _sharedStepperDisable);
+        handler.item("shared_stepper_disable_pin", _sharedStepperDisable);
+        handler.item("shared_stepper_reset_pin", _sharedStepperReset);
 
         // Handle axis names xyzabc.  handler.section is inferred
         // from a template.
@@ -217,6 +225,51 @@ namespace Machine {
                 _axis[i] = new Axis(i);
             }
         }
+    }
+
+    std::string Axes::maskToNames(AxisMask mask) {
+        std::string retval("");
+        auto        n_axis = _numberAxis;
+        for (int axis = 0; axis < n_axis; axis++) {
+            if (bitnum_is_true(mask, axis)) {
+                retval += _names[axis];
+            }
+        }
+        return retval;
+    }
+    std::string Axes::motorMaskToNames(MotorMask mask) {
+        std::string retval("");
+        auto        n_axis = _numberAxis;
+        for (int axis = 0; axis < n_axis; axis++) {
+            if (bitnum_is_true(mask, axis)) {
+                retval += " ";
+                retval += _names[axis];
+            }
+        }
+        mask >>= 16;
+        for (int axis = 0; axis < n_axis; axis++) {
+            if (bitnum_is_true(mask, axis)) {
+                retval += " ";
+                retval += _names[axis];
+                retval += "2";
+            }
+        }
+        return retval;
+    }
+
+    bool Axes::namesToMask(const char* names, AxisMask& mask) {
+        bool retval = true;
+        for (int i = 0; i < strlen(names); i++) {
+            char  axisName = toupper(names[i]);
+            char* pos      = index(_names, axisName);
+            if (!pos) {
+                log_error("Invalid axis name " << names[i]);
+                retval = false;
+            }
+            set_bitnum(mask, pos - Machine::Axes::_names);
+        }
+
+        return retval;
     }
 
     Axes::~Axes() {

@@ -16,6 +16,7 @@ namespace MotorDrivers {
 namespace Machine {
     class Axis : public Configuration::Configurable {
         int _axis;
+        int motorsWithSwitches();
 
     public:
         Axis(int currentAxis) : _axis(currentAxis) {
@@ -29,10 +30,10 @@ namespace Machine {
         Motor*  _motors[MAX_MOTORS_PER_AXIS];
         Homing* _homing = nullptr;
 
-        float _stepsPerMm   = 320.0f;
+        float _stepsPerMm   = 80.0f;
         float _maxRate      = 1000.0f;
         float _acceleration = 25.0f;
-        float _maxTravel    = 200.0f;
+        float _maxTravel    = 1000.0f;
         bool  _softLimits   = false;
 
         // Configuration system helpers:
@@ -40,12 +41,14 @@ namespace Machine {
         void afterParse() override;
 
         // Checks if a motor matches this axis:
-        bool  hasMotor(const MotorDrivers::MotorDriver* const driver) const;
-        bool  hasDualMotor();
-        int   motorsWithSwitches();
-        float pulloffOffset();
+        bool hasMotor(const MotorDrivers::MotorDriver* const driver) const;
+        bool hasDualMotor();
+
+        float commonPulloff();
+        float extraPulloff();
 
         void init();
+        void config_motors();
 
         ~Axis();
     };
