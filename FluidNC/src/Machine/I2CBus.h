@@ -5,17 +5,18 @@
 
 #include "../Configuration/Configurable.h"
 
-#include <esp_attr.h>
+#include "../Platform.h"
 
 class TwoWire;
 
 namespace Machine {
     class I2CBus : public Configuration::Configurable {
-    private:
-        bool _error = false;
+    protected:
+        TwoWire* i2c = nullptr;
+        // bool _error = false;
 
     public:
-        I2CBus(int busNumber);
+        I2CBus(int bus);
 
         int      _busNumber = 0;
         Pin      _sda;
@@ -26,8 +27,10 @@ namespace Machine {
         void validate() override;
         void group(Configuration::HandlerBase& handler) override;
 
-        int write(uint8_t address, const uint8_t* data, size_t count);
-        int read(uint8_t address, uint8_t* data, size_t count);
+        static const char* ErrorDescription(int code);
+
+        int IRAM_ATTR write(uint8_t address, const uint8_t* data, size_t count);
+        int IRAM_ATTR read(uint8_t address, uint8_t* data, size_t count);
 
         ~I2CBus() = default;
     };

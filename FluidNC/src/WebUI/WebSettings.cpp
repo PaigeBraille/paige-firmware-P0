@@ -22,7 +22,7 @@
 #include "Commands.h"  // COMMANDS::restart_MCU();
 #include "WifiConfig.h"
 
-#include "src/HashFS.h"
+#include "../HashFS.h"
 
 #include <cstring>
 #include <sstream>
@@ -323,11 +323,11 @@ namespace WebUI {
 
     static Error runFile(const char* fs, char* parameter, AuthenticationLevel auth_level, Channel& out) {
         Error err;
-        if (sys.state == State::Alarm || sys.state == State::ConfigAlarm) {
+        if (sys.state() == State::Alarm || sys.state() == State::ConfigAlarm) {
             log_to(out, "Alarm");
             return Error::IdleError;
         }
-        if (sys.state != State::Idle) {
+        if (sys.state() != State::Idle) {
             log_to(out, "Busy");
             return Error::IdleError;
         }

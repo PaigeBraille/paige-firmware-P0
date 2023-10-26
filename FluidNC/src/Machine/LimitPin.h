@@ -1,3 +1,6 @@
+// Copyright (c) 2021 -  Mitch Bradley
+// Use of this source code is governed by a GPLv3 license that can be found in the LICENSE file.
+
 #pragma once
 
 #include "EventPin.h"
@@ -26,7 +29,7 @@ namespace Machine {
         volatile uint32_t* _negLimits = nullptr;
 
     public:
-        LimitPin(Pin& pin, int axis, int motorNum, int direction, bool& phardLimits, bool& pLimited);
+        LimitPin(Pin& pin, int axis, int motor, int direction, bool& pHardLimits, bool& pLimited);
 
         void update(bool value) override;
 
